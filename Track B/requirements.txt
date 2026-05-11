@@ -1,0 +1,7 @@
+fastapi
+openai
+pydantic
+pandas
+datasets
+flask
+gunicorn
