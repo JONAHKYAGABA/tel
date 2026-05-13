@@ -39,3 +39,14 @@ ENV/
 
 # Legacy local artifact
 */gt.csv
+
+# Scratch / IDE temp files (must never contain secrets)
+Untitled-*
+Untitled-*.sh
+Untitled-*.py
+Untitled-*.txt
+*.scratch
+
+# Env files
+.env
+.env.*

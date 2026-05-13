@@ -130,8 +130,14 @@ def _fetch_tool_defs(tool_url: str, timeout_s: float = 10.0) -> List[Dict[str, A
     global _TOOL_DEFS_CACHE
     if _TOOL_DEFS_CACHE is not None:
         return _TOOL_DEFS_CACHE
+    headers: Dict[str, str] = {}
+    bearer = os.environ.get("TOOL_BEARER_TOKEN") or os.environ.get("AGENT_API_KEY")
+    if bearer and not bearer.startswith("sk-dummy"):
+        headers["Authorization"] = f"Bearer {bearer}"
+    verify = os.environ.get("TOOL_VERIFY_TLS", "1") == "1"
     try:
-        r = requests.get(f"{tool_url.rstrip('/')}/tools", timeout=timeout_s)
+        r = requests.get(f"{tool_url.rstrip('/')}/tools", timeout=timeout_s,
+                         headers=headers, verify=verify)
         r.raise_for_status()
         raw = r.json()
     except Exception as exc:
@@ -234,23 +240,32 @@ def _execute_tool(
     arguments: Dict[str, Any],
     scenario_id: str,
     tool_url: str,
-    timeout_s: float = 5.0,
+    timeout_s: float = 10.0,
 ) -> str:
-    """Call server.py tool endpoint. Returns JSON string (or error JSON)."""
+    """Call server.py tool endpoint (local or Phase-2 cloud).
+    Picks up TOOL_BEARER_TOKEN / AGENT_API_KEY from env for cloud auth."""
     endpoint = ENDPOINT_MAP.get(name)
     if endpoint is None:
-        # Last-ditch: try the tool name itself as a path (e.g. /tool_name).
         endpoint = "/" + name.replace("_", "-")
+    headers: Dict[str, str] = {}
+    if scenario_id:
+        headers["X-Scenario-Id"] = scenario_id
+    bearer = os.environ.get("TOOL_BEARER_TOKEN") or os.environ.get("AGENT_API_KEY")
+    if bearer and not bearer.startswith("sk-dummy"):
+        headers["Authorization"] = f"Bearer {bearer}"
+        headers["Content-Type"] = "application/json"
+    # Cloud endpoints serve over HTTPS with self-signed certs sometimes; tolerate that
+    verify = os.environ.get("TOOL_VERIFY_TLS", "1") == "1"
     try:
         r = requests.get(
             f"{tool_url.rstrip('/')}{endpoint}",
             params=arguments,
-            headers={"X-Scenario-Id": scenario_id} if scenario_id else {},
+            headers=headers,
             timeout=timeout_s,
+            verify=verify,
         )
         if r.status_code != 200:
             return json.dumps({"error": f"status {r.status_code}", "detail": r.text[:200]})
-        # Truncate huge tool results so they don't blow the next-turn prompt
         text = r.text or ""
         if len(text) > 1500:
             text = text[:1500] + " ...[truncated]"

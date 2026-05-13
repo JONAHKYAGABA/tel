@@ -52,15 +52,64 @@ MAX_CHUNK = 1500
 SPLIT_AT = 1200
 
 
+def _read_file_text(path: Path) -> str:
+    """Return plain text for .txt / .html / .pdf. Returns '' on unsupported types."""
+    suffix = path.suffix.lower()
+    if suffix in (".txt", ".md"):
+        return path.read_text(encoding="utf-8", errors="ignore")
+    if suffix in (".html", ".htm"):
+        # Strip HTML — prefer trafilatura if available, else regex fallback
+        try:
+            import trafilatura  # type: ignore
+            html = path.read_text(encoding="utf-8", errors="ignore")
+            txt = trafilatura.extract(html, include_comments=False, include_tables=True)
+            return txt or ""
+        except ImportError:
+            html = path.read_text(encoding="utf-8", errors="ignore")
+            txt = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
+            txt = re.sub(r"<style[\s\S]*?</style>", "", txt, flags=re.IGNORECASE)
+            txt = re.sub(r"<[^>]+>", " ", txt)
+            return re.sub(r"\s+", " ", txt)
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader  # type: ignore
+        except ImportError:
+            print(f"  [skip] pypdf not installed; cannot parse {path.name}", file=sys.stderr)
+            return ""
+        try:
+            reader = PdfReader(str(path))
+            pages = []
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pages.append("")
+            return "\n\n".join(pages)
+        except Exception as exc:
+            print(f"  [skip] failed to parse {path.name}: {exc}", file=sys.stderr)
+            return ""
+    return ""
+
+
 def chunk_file(path: Path) -> list[dict]:
-    text = path.read_text(encoding="utf-8")
-    head, _, body = text.partition("\n\n")
-    source = head.replace("SOURCE: ", "").strip() if head.startswith("SOURCE:") else str(path.name)
-    if not body:
-        body = text  # no header
+    text = _read_file_text(path)
+    if not text:
+        return []
+
+    # Strip a SOURCE: header if it's a .txt scraped file
+    head, _, maybe_body = text.partition("\n\n")
+    if head.startswith("SOURCE:"):
+        source = head.replace("SOURCE: ", "").strip()
+        body = maybe_body if maybe_body else text
+    else:
+        source = path.name
+        body = text
 
     chunks: list[dict] = []
     paras = [p.strip() for p in re.split(r"\n\s*\n", body) if len(p.strip()) > MIN_PARA]
+    # If no paragraph breaks (PDF text often comes back as one blob), fall back to fixed-size split
+    if not paras and len(body.strip()) > MIN_PARA:
+        paras = [body[i:i + MAX_CHUNK] for i in range(0, len(body), SPLIT_AT)]
     for i, p in enumerate(paras):
         if len(p) <= MAX_CHUNK:
             chunks.append({
@@ -80,12 +129,17 @@ def chunk_file(path: Path) -> list[dict]:
 
 def main() -> int:
     if not RAW_DIR.exists():
-        print(f"FATAL: {RAW_DIR} not found. Run scripts/scrape_5g_kb.py first.",
+        print(f"FATAL: {RAW_DIR} not found. Run scripts/download_rag_docs.sh first.",
               file=sys.stderr)
         return 1
-    raw_files = sorted(RAW_DIR.glob("doc_*.txt"))
+    # Accept .txt, .md, .html/.htm, .pdf
+    patterns = ("*.txt", "*.md", "*.html", "*.htm", "*.pdf")
+    raw_files: list[Path] = []
+    for p in patterns:
+        raw_files.extend(RAW_DIR.glob(p))
+    raw_files = sorted(set(raw_files))
     if not raw_files:
-        print(f"FATAL: no doc_*.txt in {RAW_DIR}", file=sys.stderr)
+        print(f"FATAL: no .txt/.md/.html/.pdf in {RAW_DIR}", file=sys.stderr)
         return 1
 
     print(f"[index] reading {len(raw_files)} raw files from {RAW_DIR}")
@@ -93,7 +147,7 @@ def main() -> int:
     for f in raw_files:
         cs = chunk_file(f)
         all_chunks.extend(cs)
-        print(f"  {f.name:>14s}  ->  {len(cs):>3d} chunks")
+        print(f"  {f.name:>40s}  ->  {len(cs):>4d} chunks")
     print(f"[index] total chunks: {len(all_chunks)}")
 
     if not all_chunks:

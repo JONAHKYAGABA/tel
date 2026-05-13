@@ -54,6 +54,11 @@ cd "$PROJECT_DIR"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
 LLM_PORT="${LLM_PORT:-8001}"
 TOOL_PORT="${TOOL_PORT:-7860}"
+# Phase 2: set TOOL_URL to Zindi's cloud endpoint, e.g.
+#   export TOOL_URL=https://124.71.227.61/no
+#   export TOOL_BEARER_TOKEN=<your-token>
+# Default = local server.py (Phase 1 style).
+TOOL_URL="${TOOL_URL:-http://localhost:$TOOL_PORT}"
 TEST_FILE="${TEST_FILE:-data/Phase_1/test.json}"
 TRAIN_FOLD="${TRAIN_FOLD:-data/local_split/train_1800.json}"
 HOLDOUT="${HOLDOUT:-data/local_split/holdout_200.json}"
@@ -111,14 +116,32 @@ start_llm_server() {
 }
 
 ensure_tool_server() {
-    if curl -sf "http://localhost:$TOOL_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    # If TOOL_URL is remote (Phase 2 cloud), don't start a local server.py.
+    case "$TOOL_URL" in
+        http://localhost*|http://127.0.0.1*)
+            ;;
+        *)
+            # remote — just verify reachability (auth header may be required, so 401 is OK)
+            local code
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
+                ${TOOL_BEARER_TOKEN:+-H "Authorization: Bearer $TOOL_BEARER_TOKEN"} \
+                -k "$TOOL_URL/health" 2>/dev/null || echo 000)
+            if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ]; then
+                c_yel "  using remote TOOL_URL=$TOOL_URL  (http=$code)"
+                return 0
+            fi
+            c_red "  remote TOOL_URL=$TOOL_URL unreachable (http=$code)"
+            return 1
+            ;;
+    esac
+    if curl -sf "$TOOL_URL/health" 2>/dev/null | grep -q '"status":"ok"'; then
         return 0
     fi
     pkill -f "python server.py" 2>/dev/null || true
     sleep 2
     DATA_SPLIT=test nohup python server.py > "$TOOL_LOG" 2>&1 &
     echo "  tool pid=$!"
-    wait_health "http://localhost:$TOOL_PORT/health" 60
+    wait_health "$TOOL_URL/health" 60
 }
 
 zindi_convert() {
@@ -255,7 +278,7 @@ else
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/agentic_holdout \
             --llm_url   "http://localhost:$LLM_PORT" \
-            --tool_url  "http://localhost:$TOOL_PORT" \
+            --tool_url  "$TOOL_URL" \
             --max_tokens 384 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/agentic_holdout.log
     fi
@@ -342,7 +365,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/holdout_lora \
             --llm_url   "http://localhost:$LLM_PORT" \
-            --tool_url  "http://localhost:$TOOL_PORT" \
+            --tool_url  "$TOOL_URL" \
             --max_tokens 384 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora.log
     fi
@@ -384,7 +407,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/holdout_lora_rag \
             --llm_url   "http://localhost:$LLM_PORT" \
-            --tool_url  "http://localhost:$TOOL_PORT" \
+            --tool_url  "$TOOL_URL" \
             --max_tokens 384 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora_rag.log
     fi
@@ -443,7 +466,7 @@ else
             --test_file "$TEST_FILE" \
             --out_dir   "$FINAL_DIR" \
             --llm_url   "http://localhost:$LLM_PORT" \
-            --tool_url  "http://localhost:$TOOL_PORT" \
+            --tool_url  "$TOOL_URL" \
             --max_tokens 384 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee "${FINAL_DIR}.log"
     fi
