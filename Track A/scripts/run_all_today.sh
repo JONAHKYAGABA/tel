@@ -213,6 +213,43 @@ else
     c_green "  cache: $(du -sh "$CACHE_DIR" | cut -f1)"
 fi
 
+# ============ B'. Phase 2 data (HF dataset via huggingface_hub) ====
+# Only triggers when TEST_FILE points to a Phase_2 path that's missing or
+# clearly corrupt (e.g. 155-byte HTML error page from earlier curl).
+case "$TEST_FILE" in
+    *Phase_2*)
+        step "B'. Phase 2 test data (via huggingface_hub, handles auth + xet)"
+        TEST_SIZE=0
+        [ -f "$TEST_FILE" ] && TEST_SIZE=$(stat -c%s "$TEST_FILE" 2>/dev/null || echo 0)
+        if [ "$TEST_SIZE" -ge 100000 ]; then
+            c_yel "  $TEST_FILE already $(du -h "$TEST_FILE" | cut -f1) — skipping"
+        else
+            rm -f "$TEST_FILE" data/Phase_2/README.md 2>/dev/null
+            mkdir -p data/Phase_2
+            python <<'PYEOF' || { c_red "Phase 2 data download failed (check HF_TOKEN + dataset access)"; exit 1; }
+import os, shutil
+from huggingface_hub import hf_hub_download
+for fname in ["test.json", "README.md"]:
+    cached = hf_hub_download(
+        repo_id="netop/Telco-Troubleshooting-Agentic-Challenge",
+        repo_type="dataset",
+        filename=f"Track A/data/Phase_2/{fname}",
+        token=os.environ.get("HF_TOKEN"),
+    )
+    dest = f"data/Phase_2/{fname}"
+    shutil.copy(cached, dest)
+    size = os.path.getsize(dest)
+    print(f"  {fname}: {size:,} bytes")
+PYEOF
+            python -c "
+import json
+t = json.load(open('$TEST_FILE'))
+print(f'  scenarios={len(t)}  first_id={t[0][\"scenario_id\"][:8]}')
+"
+        fi
+        ;;
+esac
+
 # ============ C. start servers =====================================
 step "C. Start llm_server on :$LLM_PORT and tool server on :$TOOL_PORT"
 if curl -sf "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
