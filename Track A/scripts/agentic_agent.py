@@ -429,11 +429,11 @@ def main() -> int:
     ap.add_argument("--llm_url", default=os.environ.get("LLM_URL", "http://localhost:8001"))
     ap.add_argument("--tool_url", default=os.environ.get("TOOL_URL", "http://localhost:7860"))
     ap.add_argument("--model_name", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
-    ap.add_argument("--max_tokens", type=int, default=512)
-    ap.add_argument("--llm_timeout_s", type=float, default=90.0)
+    ap.add_argument("--max_tokens", type=int, default=256)
+    ap.add_argument("--llm_timeout_s", type=float, default=75.0)
     ap.add_argument("--scenario_timeout_s", type=float, default=180.0)
     ap.add_argument("--max_samples", type=int, default=None)
-    ap.add_argument("--max_tool_calls", type=int, default=2,
+    ap.add_argument("--max_tool_calls", type=int, default=1,
                     help="Max number of tool-call turns per scenario before forcing final answer.")
     args = ap.parse_args()
 
