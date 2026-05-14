@@ -318,11 +318,26 @@ def load_model(model_id: str, lora_path: Optional[str] = None) -> None:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
     )
+
+    # Reserve headroom for activations + KV cache on each GPU. Without this,
+    # device_map="auto" packs the second GPU full of weights and 3000-token
+    # prompts OOM trying to allocate 5-6 GB for the forward pass.
+    # LLM_PER_GPU_GIB env var lets you tune (default leaves ~5 GB headroom on 48 GB cards).
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    max_memory = None
+    if n_gpus >= 1:
+        per_gpu = os.environ.get("LLM_PER_GPU_GIB", "42")
+        cpu_off = os.environ.get("LLM_CPU_OFFLOAD_GIB", "96")
+        max_memory = {i: f"{per_gpu}GiB" for i in range(n_gpus)}
+        max_memory["cpu"] = f"{cpu_off}GiB"
+        log.info(f"using max_memory={max_memory} (override via LLM_PER_GPU_GIB env)")
+
     t0 = time.time()
     base = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb,
         device_map="auto",
+        max_memory=max_memory,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     )

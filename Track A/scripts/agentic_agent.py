@@ -274,7 +274,7 @@ _BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
 _CX_RE = re.compile(r"\bC\d+\b")
 
 
-def _truncate_scenario(scenario: Dict[str, Any], max_chars: int = 9000) -> str:
+def _truncate_scenario(scenario: Dict[str, Any], max_chars: int = 5500) -> str:
     """Render scenario data with priority order. Drop low-value tables if oversize."""
     d = scenario.get("data") or {}
     parts: List[str] = []
@@ -525,9 +525,9 @@ def main() -> int:
     ap.add_argument("--llm_url", default=os.environ.get("LLM_URL", "http://localhost:8001"))
     ap.add_argument("--tool_url", default=os.environ.get("TOOL_URL", "http://localhost:7860"))
     ap.add_argument("--model_name", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
-    ap.add_argument("--max_tokens", type=int, default=384)
-    ap.add_argument("--llm_timeout_s", type=float, default=45.0)
-    ap.add_argument("--scenario_timeout_s", type=float, default=120.0)
+    ap.add_argument("--max_tokens", type=int, default=192)
+    ap.add_argument("--llm_timeout_s", type=float, default=60.0)
+    ap.add_argument("--scenario_timeout_s", type=float, default=150.0)
     ap.add_argument("--max_samples", type=int, default=None)
     ap.add_argument("--max_tool_calls", type=int, default=2,
                     help="Max number of tool-call turns per scenario before forcing final answer.")

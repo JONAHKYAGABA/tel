@@ -316,7 +316,7 @@ else
             --out_dir   eval/results/agentic_holdout \
             --llm_url   "http://localhost:$LLM_PORT" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 2 \
+            --max_tokens 192 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/agentic_holdout.log
     fi
     SCORE_BASE=$(extract_score eval/results/agentic_holdout.log)
@@ -403,7 +403,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --out_dir   eval/results/holdout_lora \
             --llm_url   "http://localhost:$LLM_PORT" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 2 \
+            --max_tokens 192 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora.log
     fi
     SCORE_LORA=$(extract_score eval/results/holdout_lora.log)
@@ -445,7 +445,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --out_dir   eval/results/holdout_lora_rag \
             --llm_url   "http://localhost:$LLM_PORT" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 2 \
+            --max_tokens 192 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora_rag.log
     fi
     SCORE_LORA_RAG=$(extract_score eval/results/holdout_lora_rag.log)
@@ -504,7 +504,7 @@ else
             --out_dir   "$FINAL_DIR" \
             --llm_url   "http://localhost:$LLM_PORT" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 2 \
+            --max_tokens 192 --max_tool_calls 2 \
             --scenario_timeout_s 120 2>&1 | tee "${FINAL_DIR}.log"
     fi
 fi
