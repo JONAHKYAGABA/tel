@@ -54,141 +54,45 @@ from scripts.build_baseline_submission import is_multi as task_is_multi  # noqa:
 
 # --------------------------------------------------------------------- prompts
 
-SYSTEM_PROMPT_BASE = """\
-You are a senior 5G RAN drive-test troubleshooting engineer with deep
-expertise in coverage, interference, mobility (handover), and scheduling
-diagnostics. You will be given ONE scenario containing:
-  • network_configuration_data — gNodeB/Cell IDs, PCI, azimuth, mechanical
-    downtilt, digital tilt, height, ARFCN, BW, TxPower, A2/A3/A5 thresholds.
-  • user_plane_data — per-timestamp KPIs: serving PCI, RSRP, SINR,
-    DL throughput, BLER, MCS, RB count, neighbor top-N PCI + RSRP.
-  • signaling_plane_data — RRC events (Reestablish attempts, NREventA2/A3/A5,
-    RandomAccess, etc.) with timestamps.
-  • traffic_data — cell-level DL/UL PRB utilization, weak-coverage ratio,
-    CCE allocation success rate, downlink user throughput.
-  • mr_data — measurement reports: serving PCI/RSRP and Neighbor 1-3 PCI/RSRP.
+_SYSTEM_BODY = """\
+You are a 5G RAN drive-test troubleshooting expert. Given raw KPIs from one \
+scenario and 22 candidate actions, pick the right one(s).
 
-==============================================================
-DIAGNOSTIC PROCEDURE (follow strictly — DO NOT skip a step):
-==============================================================
-
-STEP 1 — LOCATE THE THROUGHPUT COLLAPSE
-  Scan user_plane_data for the row where DL throughput drops by ≥50%
-  versus the trailing 3-row mean. Record:
-    t_drop          = timestamp of the collapse
-    PCI_serving     = serving PCI at t_drop
-    gNB_cell_serv   = the gNodeB_Cell pair whose PCI matches PCI_serving
-                      (look it up in network_configuration_data)
-
-STEP 2 — CLASSIFY THE FAILURE MODE
-  Compare the 3 rows BEFORE t_drop vs the row AT t_drop on these KPIs:
-    ΔRSRP   = RSRP_pre - RSRP_at         (positive = degradation)
-    ΔSINR   = SINR_pre - SINR_at         (positive = degradation)
-    ΔBLER   = BLER_at - BLER_pre         (positive = degradation)
-    ΔRB     = RB_pre - RB_at             (positive = scheduler starvation)
-
-  Decision tree:
-    A. COVERAGE (serving cell):    ΔRSRP > 6 dB  AND  ΔSINR > 5 dB
-    B. INTERFERENCE (neighbor):    ΔSINR > 5 dB  AND  ΔRSRP < 3 dB
-                                   AND a neighbor in mr_data has
-                                   RSRP within 3 dB of serving RSRP
-    C. INTERFERENCE/QUALITY:       ΔBLER > 20 pp AND low MCS at t_drop
-    D. SCHEDULER / PDCCH:          ΔRSRP < 3, ΔSINR < 3, MCS healthy
-                                   BUT ΔRB > 50% drop, or CCE Allocation
-                                   Success Rate is low in traffic_data
-    E. MOBILITY (handover):        NRRRCReestablishAttempt fires near t_drop,
-                                   OR repeated NREventA3 firings (ping-pong)
-
-STEP 3 — CROSS-CHECK SIGNALING IN [t_drop − 5s, t_drop + 5s]
-  • NRRRCReestablishAttempt        → missing neighbor relation, or A3/A5 wrong
-  • Repeated NREventA3 same target → ping-pong, A3 Offset wrong on serving
-  • RSRP low but no NREventA2      → A2 threshold too strict; lower
-    CovInterFreqA2RsrpThld on the serving cell
-
-STEP 4 — CROSS-CHECK CELL-LEVEL KPIs (traffic_data)
-  • High Downlink Weak Coverage Ratio    → confirms COVERAGE
-  • Low Downlink CCE Allocation Success  → confirms PDCCH / SCHEDULER
-  • High PRB Utilization + throughput dip → load/scheduling
-
-STEP 5 — STRATEGIC TOOL USE (≤2 calls total, ONLY if needed)
-  Tools cost wall-clock time. Call ONLY when one specific option needs
-  disambiguation between two candidate actions:
-    • judge_mainlobe_or_not(time, pci)
-        Disambiguates azimuth-rotation vs tilt-change. If UE is OUTSIDE
-        mainlobe → prefer azimuth. If INSIDE → prefer tilt.
-    • calculate_overlap_ratio(pci_serving, pci_neighbor)
-        > 0.3 implicates that neighbor as the interferer.
-    • calculate_pathloss(time, pci)
-        Confirms coverage degradation when RSRP-based reasoning is ambiguous.
-
-  Do NOT call the same tool twice. Do NOT call data-fetch tools — the
-  scenario already inlines all required data.
-
-STEP 6 — MAP FAILURE MODE → ACTION TEMPLATE → CORRECT CELL
-  The 22 options are templated actions, each parameterised by a specific
-  gNodeB_Cell pair. Match the failure mode to the action template AND
-  verify the cell ID in the option matches the correct cell:
-
-    COVERAGE  (on serving):
-        → "Increase transmission power for <serving_cell>"
-        → "Lift the tilt of <serving_cell> by N degrees"
-        → "Adjust the azimuth of <serving_cell> by N degrees"
-        → "Decrease CovInterFreqA2RsrpThld <serving_cell>"
-
-    INTERFERENCE (from neighbor):
-        → "Press down the tilt of <neighbor_cell> by N degrees"
-        → "Adjust the azimuth of <neighbor_cell> by N degrees"
-        → "Decrease transmission power for <neighbor_cell>"
-        → "Increase A3 Offset threshold for <serving_cell>"
-        → "Add neighbor relationship between <serving> and <neighbor>"
-
-    PDCCH / SCHEDULER:
-        → "Modify PdcchOccupiedSymbolNum to 2SYM for <cell>"
-        → "Check test server and transmission issues"
-
-    AMBIGUOUS / INSUFFICIENT:
-        → "Insufficient data; more data is needed for judgment" — pick this
-          ONLY when no other option clearly applies AND the radio signals
-          are within healthy ranges with no clear failure pattern.
-
-STEP 7 — FORMAT THE ANSWER
-  Keep reasoning concise (≤250 tokens). Then on the LAST line of your
-  reply, output exactly:
+Procedure (be concise — ≤200 tokens reasoning):
+1. In user_plane_data, find t_drop = first row where DL throughput drops \
+≥50% vs trailing rows. Record serving PCI at t_drop and the matching \
+gNodeB_Cell from network_configuration_data.
+2. Classify the failure by comparing 3 rows BEFORE t_drop vs t_drop:
+   - COVERAGE (serving cell): RSRP drops >6 dB AND SINR drops >5 dB
+   - INTERFERENCE (neighbor): SINR drops >5 dB, RSRP stable, a neighbor in \
+mr_data is within 3 dB of serving RSRP
+   - QUALITY: BLER jumps >20pp, low MCS at t_drop → treat as INTERFERENCE
+   - PDCCH/SCHEDULER: RSRP+SINR healthy but RB count drops sharply, or low \
+CCE Allocation Success Rate in traffic_data
+   - MOBILITY: NRRRCReestablishAttempt or repeated NREventA3 near t_drop
+3. Optionally call ONE tool only if uncertain between two actions:
+   - judge_mainlobe_or_not(time, pci): tilt vs azimuth disambiguation
+   - calculate_overlap_ratio(pci_serving, pci_neighbor): >0.3 implicates neighbor
+   - calculate_pathloss(time, pci): confirms coverage
+   Skip tools if data is clear. Never call data-fetch tools.
+4. Map mode → action template → correct cell:
+   COVERAGE: increase power / lift tilt / azimuth / lower A2 threshold on SERVING
+   INTERFERENCE: tilt-down / azimuth / decrease power on NEIGHBOR, or \
+A3 Offset / add neighbor relation
+   PDCCH: PdcchOccupiedSymbolNum=2SYM
+   Pick "Insufficient data" ONLY if all radio signals are clean with no failure pattern.
 """
 
-SYSTEM_PROMPT_SINGLE = SYSTEM_PROMPT_BASE + """\
-    \\boxed{Cx}
-
-  Where Cx is ONE option ID (e.g. C7). The task says
-  "Select the most appropriate" — pick exactly one.
-
-EXAMPLES of correct final lines:
-    \\boxed{C7}
-    \\boxed{C12}
-    \\boxed{C20}
-
-DO NOT output multiple options, comma-separated, or any text after \\boxed{}.
+SYSTEM_PROMPT_SINGLE = _SYSTEM_BODY + """\
+Output ONLY one line at the end: \\boxed{Cx} (one option ID).
+Examples: \\boxed{C7}    \\boxed{C12}    \\boxed{C20}
 """
 
-SYSTEM_PROMPT_MULTI = SYSTEM_PROMPT_BASE + """\
-    \\boxed{Cx|Cy|Cz}
-
-  Where 2-4 option IDs appear in ASCENDING numeric order, separated by the
-  pipe character (|), no spaces. The task says "Select two to four".
-
-  Scoring is intersection-over-union (IoU) — missing a correct option
-  hurts as much as adding a wrong one. Pick the 2-3 actions most likely
-  to address the failure mode. When in doubt, prefer 3 plausible options
-  over 1 confident option (recall > precision for IoU).
-
-EXAMPLES of correct final lines:
-    \\boxed{C3|C7}
-    \\boxed{C5|C9|C11|C20}
-    \\boxed{C2|C8|C16}
-
-DO NOT use commas. DO NOT use other separators. DO NOT output a single
-option for multi-answer tasks. Two to four pipe-separated options,
-ascending, on the last line.
+SYSTEM_PROMPT_MULTI = _SYSTEM_BODY + """\
+Multi-answer: scoring is IoU, missing a right option costs as much as adding a \
+wrong one. Pick 2-4 plausible options (prefer 3 over 1).
+Output ONLY one line at the end: \\boxed{Cx|Cy|Cz} (2-4 IDs, ascending, pipe-separated, no spaces).
+Examples: \\boxed{C3|C7}    \\boxed{C5|C9|C11|C20}    \\boxed{C2|C8|C16}
 """
 
 
@@ -274,7 +178,7 @@ _BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
 _CX_RE = re.compile(r"\bC\d+\b")
 
 
-def _truncate_scenario(scenario: Dict[str, Any], max_chars: int = 5500) -> str:
+def _truncate_scenario(scenario: Dict[str, Any], max_chars: int = 7500) -> str:
     """Render scenario data with priority order. Drop low-value tables if oversize."""
     d = scenario.get("data") or {}
     parts: List[str] = []
@@ -525,9 +429,9 @@ def main() -> int:
     ap.add_argument("--llm_url", default=os.environ.get("LLM_URL", "http://localhost:8001"))
     ap.add_argument("--tool_url", default=os.environ.get("TOOL_URL", "http://localhost:7860"))
     ap.add_argument("--model_name", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
-    ap.add_argument("--max_tokens", type=int, default=192)
-    ap.add_argument("--llm_timeout_s", type=float, default=60.0)
-    ap.add_argument("--scenario_timeout_s", type=float, default=150.0)
+    ap.add_argument("--max_tokens", type=int, default=512)
+    ap.add_argument("--llm_timeout_s", type=float, default=90.0)
+    ap.add_argument("--scenario_timeout_s", type=float, default=180.0)
     ap.add_argument("--max_samples", type=int, default=None)
     ap.add_argument("--max_tool_calls", type=int, default=2,
                     help="Max number of tool-call turns per scenario before forcing final answer.")
