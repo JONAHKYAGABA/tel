@@ -234,6 +234,8 @@ def _fetch_tool_defs(tool_url: str, timeout_s: float = 10.0) -> List[Dict[str, A
     headers: Dict[str, str] = {}
     bearer = os.environ.get("TOOL_BEARER_TOKEN") or os.environ.get("AGENT_API_KEY")
     if bearer and not bearer.startswith("sk-dummy"):
+        # Phase 2 cloud sandbox uses X-API-Token; keep Authorization for local fallback
+        headers["X-API-Token"] = bearer
         headers["Authorization"] = f"Bearer {bearer}"
     verify = os.environ.get("TOOL_VERIFY_TLS", "1") == "1"
     try:
@@ -344,7 +346,7 @@ def _execute_tool(
     timeout_s: float = 10.0,
 ) -> str:
     """Call server.py tool endpoint (local or Phase-2 cloud).
-    Picks up TOOL_BEARER_TOKEN / AGENT_API_KEY from env for cloud auth."""
+    Phase-2 cloud uses X-API-Token header (NOT Authorization: Bearer)."""
     endpoint = ENDPOINT_MAP.get(name)
     if endpoint is None:
         endpoint = "/" + name.replace("_", "-")
@@ -353,8 +355,10 @@ def _execute_tool(
         headers["X-Scenario-Id"] = scenario_id
     bearer = os.environ.get("TOOL_BEARER_TOKEN") or os.environ.get("AGENT_API_KEY")
     if bearer and not bearer.startswith("sk-dummy"):
+        # Phase 2 cloud sandbox auth: X-API-Token header
+        headers["X-API-Token"] = bearer
+        # Also send Authorization for any vanilla server.py instances
         headers["Authorization"] = f"Bearer {bearer}"
-        headers["Content-Type"] = "application/json"
     # Cloud endpoints serve over HTTPS with self-signed certs sometimes; tolerate that
     verify = os.environ.get("TOOL_VERIFY_TLS", "1") == "1"
     try:
