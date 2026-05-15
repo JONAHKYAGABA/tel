@@ -331,28 +331,48 @@ def load_model(model_id: str, lora_path: Optional[str] = None) -> None:
     # forces accelerate to pack everything on-device. To enable CPU offload
     # explicitly, set LLM_CPU_OFFLOAD_GIB to a positive integer AND export
     # LLM_INT8_FP32_CPU_OFFLOAD=1.
+    # Key insight: accelerate.infer_auto_device_map measures the UNQUANTIZED
+    # weight size (35B fp16 ≈ 70 GB) when deciding the device map, NOT the
+    # post-bnb size (~20 GB). On a single 48 GB GPU it concludes "won't fit"
+    # and spills the overflow to CPU. bnb then sees CPU-dispatched layers and
+    # refuses with "Some modules are dispatched on the CPU or the disk".
+    #
+    # The fix: when only ONE GPU is visible, bypass infer_auto_device_map
+    # entirely with an explicit device_map={"": 0}. The quantized 4-bit model
+    # genuinely fits in 48 GB so this just works. When TWO+ GPUs are visible,
+    # we use device_map="auto" with explicit budgets so accelerate spreads
+    # across them via pipeline parallel.
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    max_memory = None
     cpu_off_enabled = os.environ.get("LLM_INT8_FP32_CPU_OFFLOAD", "0") == "1"
-    if n_gpus >= 1:
+
+    if n_gpus == 1:
+        device_map: Any = {"": 0}
+        max_memory = None
+        log.info("single GPU visible → pinning entire model to cuda:0 "
+                 "(bypassing accelerate device-map inference)")
+    elif n_gpus >= 2:
         per_gpu = os.environ.get("LLM_PER_GPU_GIB", "42")
+        device_map = "auto"
         max_memory = {i: f"{per_gpu}GiB" for i in range(n_gpus)}
-        if cpu_off_enabled:
-            cpu_off = os.environ.get("LLM_CPU_OFFLOAD_GIB", "0")
-            if int(cpu_off) > 0:
-                max_memory["cpu"] = f"{cpu_off}GiB"
-        log.info(f"using max_memory={max_memory} (override via LLM_PER_GPU_GIB env)")
+        log.info(f"multi-GPU → using max_memory={max_memory}")
+    else:
+        device_map = "auto"
+        max_memory = None
+        log.info("no GPU → CPU only (this will be very slow)")
 
     # bnb only honours fp32 CPU offload when explicitly asked for. Without it,
     # any non-GPU dispatch is rejected at validate_environment time.
     if cpu_off_enabled:
         bnb.llm_int8_enable_fp32_cpu_offload = True
+        if isinstance(max_memory, dict):
+            max_memory["cpu"] = os.environ.get("LLM_CPU_OFFLOAD_GIB", "32") + "GiB"
+            log.info(f"fp32 CPU offload enabled, max_memory={max_memory}")
 
     t0 = time.time()
     base = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb,
-        device_map="auto",
+        device_map=device_map,
         max_memory=max_memory,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
