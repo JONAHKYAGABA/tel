@@ -38,26 +38,35 @@ from utils import extract_answer_all  # noqa: E402
 
 API_KEY = os.environ.get("AGENT_API_KEY", "dummy")
 
-TEACHER_PROMPT = """You are producing training data for a smaller reasoning model.
+TEACHER_PROMPT = """You are producing AGENTIC training data for a smaller reasoning model
+that must demonstrate tool-use during the Phase 3 code review of the Telco
+Agentic Challenge.
 
 You are given a 5G drive-test scenario, the candidate optimization actions,
-and THE CORRECT ANSWER. Your job is to produce a clean, step-by-step
-reasoning trace that arrives at exactly the given answer using only the
-data provided.
-
-Constraints:
-1. Use ONLY data from the scenario block below. Do not invent timestamps,
-   PCIs, cell IDs, or values that are not in the data.
-2. Reference at least one specific Timestamp from user_plane_data and at
-   least one specific PCI from network_configuration_data.
-3. Length 200-1000 tokens. No padding, no apologies, no caveats.
-4. Follow this diagnostic procedure: scan user-plane for the throughput
-   collapse, classify the failure mode (coverage / interference /
-   scheduler) by comparing RSRP, SINR, BLER, MCS, RB count, then map the
-   mode to the candidate action targeting the right cell.
-5. End the trace with exactly one \\boxed{{...}} on the last line. The
-   boxed value MUST equal the correct answer below (e.g. \\boxed{{C7}}
-   for single-answer, \\boxed{{C3|C7|C11}} for multi-answer).
+and THE CORRECT ANSWER. Produce a clean, agentic reasoning trace that:
+  1. Uses ONLY data from the scenario block below. Do not invent timestamps,
+     PCIs, cell IDs, or values that are not in the data.
+  2. References at least one specific Timestamp from user_plane_data and at
+     least one specific PCI from network_configuration_data.
+  3. Includes AT LEAST ONE explicit tool-call block emitted as:
+         <tool_call>{{"name": "calculate_pathloss", "arguments": {{"time": "...", "pci": ...}}}}</tool_call>
+     followed by a short "Tool returned: ...; therefore ..." reflection line.
+     Use tool names from this allowlist:
+       judge_mainlobe_or_not, calculate_overlap_ratio, calculate_pathloss,
+       calculate_horizontal_angle, calculate_tilt_angle, optimize_antenna_gain
+     Pick the tool that BEST disambiguates the failure mode you suspect.
+     You may invent plausible numeric tool returns (e.g. pathloss=125.3) that
+     are CONSISTENT with the scenario data — the smaller model is being
+     taught how to reason about tool outputs, not the exact values.
+  4. Total length 250-1000 tokens. No padding, no apologies, no caveats.
+  5. Follow this diagnostic procedure: scan user-plane for the throughput
+     collapse, classify the failure mode (coverage / interference /
+     scheduler) by comparing RSRP, SINR, BLER, MCS, RB count, call ≥1 tool
+     to verify, then map the mode to the candidate action.
+  6. End the trace with a single JSON object on the LAST line:
+       {{"answer": "{gt}", "confidence": 0.85, "agree_with_heuristic": true, "tools_used": ["<tool_name(s)>"]}}
+     The "answer" MUST equal the correct answer string exactly. Multi-answer
+     uses pipe-separated Cx in ascending numeric order (e.g. "C3|C7|C11").
 
 Correct answer: {gt}
 Question type: {qtype}
@@ -68,7 +77,7 @@ Scenario data:
 Candidate options:
 {options}
 
-Produce the reasoning trace now."""
+Produce the agentic reasoning trace now."""
 
 
 # ----------------------------- helpers -----------------------------
@@ -86,16 +95,54 @@ _BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 _TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 _PCI_RE = re.compile(r"\b\d{2,4}\b")
 _CELL_ID_RE = re.compile(r"\b\d{6,}(?:_\d+)?\b")
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*\{.*?\}\s*</tool_call>", re.DOTALL)
+_JSON_ANS_RE = re.compile(r"\{[^{}]*\"answer\"[^{}]*\}", re.DOTALL)
+
+_ALLOWED_TOOLS = {
+    "judge_mainlobe_or_not", "calculate_overlap_ratio", "calculate_pathloss",
+    "calculate_horizontal_angle", "calculate_tilt_angle", "optimize_antenna_gain",
+}
 
 
 def structural_check(trace: str, scenario: Dict[str, Any]) -> Tuple[bool, str]:
-    """Return (ok, reason)."""
+    """Return (ok, reason). Enforces agentic trace shape:
+       - ≥1 well-formed <tool_call>...</tool_call> block using an allowed tool
+       - exactly one final answer marker (JSON object or legacy \\boxed{}).
+
+    Set DISTILL_BOXED_ONLY=1 to relax the agentic check: only \\boxed{}
+    final answers are required, tool-call blocks become optional. Use this
+    fallback when the agentic accept rate is unrecoverably low.
+    """
     if not trace or len(trace) < 200:
         return False, "too_short"
-    if len(trace) > 6000:
+    if len(trace) > 8000:
         return False, "too_long"
-    if len(_BOXED_RE.findall(trace)) != 1:
-        return False, "boxed_not_unique"
+
+    boxed_only_mode = os.environ.get("DISTILL_BOXED_ONLY", "0") == "1"
+
+    if not boxed_only_mode:
+        # Require at least one tool_call block using an allowed tool.
+        tool_blocks = _TOOL_CALL_RE.findall(trace)
+        if not tool_blocks:
+            return False, "no_tool_call"
+        any_allowed = False
+        for block in tool_blocks:
+            try:
+                payload = json.loads(block[block.index("{"):block.rindex("}") + 1])
+                if payload.get("name") in _ALLOWED_TOOLS:
+                    any_allowed = True
+                    break
+            except Exception:
+                continue
+        if not any_allowed:
+            return False, "tool_call_invalid"
+
+    # Final-answer marker — JSON preferred, \boxed{} accepted.
+    json_objs = _JSON_ANS_RE.findall(trace)
+    boxed = _BOXED_RE.findall(trace)
+    if not json_objs and len(boxed) != 1:
+        return False, "no_final_answer"
+
     data = scenario.get("data", {}) or {}
     up = data.get("user_plane_data", "") or ""
     cfg = data.get("network_configuration_data", "") or ""
@@ -221,7 +268,19 @@ def main() -> int:
                     this_attempts.append({"attempt": attempt + 1, "url": urls[ci], "error": str(e)})
                     continue
                 trace = resp.choices[0].message.content or ""
-                pred = normalize_multi_answer(extract_answer_all(trace))
+                # Try JSON-format answer first (agentic teacher output), then
+                # fall back to legacy \boxed{}.
+                pred_raw = ""
+                for raw_obj in reversed(_JSON_ANS_RE.findall(trace)):
+                    try:
+                        pred_raw = str(json.loads(raw_obj).get("answer", "")).strip()
+                        if pred_raw:
+                            break
+                    except Exception:
+                        continue
+                if not pred_raw:
+                    pred_raw = extract_answer_all(trace)
+                pred = normalize_multi_answer(pred_raw)
                 gt_norm = normalize_multi_answer(gt)
                 ok_struct, why = structural_check(trace, scen)
                 this_attempts.append({
@@ -256,11 +315,35 @@ def main() -> int:
                 done_so_far = accepted + rejected
                 rate = done_so_far / max(elapsed, 1.0)
                 eta = (len(scenarios) - len(done) - done_so_far) / max(rate, 1e-6)
+                accept_rate = accepted / max(done_so_far, 1)
                 print(
                     f"[distill] {idx+1}/{len(scenarios)} "
                     f"accepted={accepted} rejected={rejected} "
+                    f"accept_rate={accept_rate:.1%} "
                     f"{rate*60:.1f}/min eta_remaining={eta/60:.0f}min"
                 )
+
+            # Early-abort watchdog: if accept rate is unrecoverably low after
+            # 200 scenarios, stop and let the orchestrator fall back to
+            # \boxed{}-only teacher prompt instead of burning hours.
+            # Override via DISTILL_ABORT_MIN_RATE=0 (disable) or a custom value.
+            done_so_far = accepted + rejected
+            min_rate_env = os.environ.get("DISTILL_ABORT_MIN_RATE", "0.15")
+            try:
+                abort_min_rate = float(min_rate_env)
+            except ValueError:
+                abort_min_rate = 0.15
+            if abort_min_rate > 0 and done_so_far >= 200:
+                live_rate = accepted / done_so_far
+                if live_rate < abort_min_rate:
+                    print(
+                        f"[distill] ABORT: accept_rate={live_rate:.1%} after "
+                        f"{done_so_far} scenarios (below {abort_min_rate:.0%}). "
+                        "Teacher cannot produce valid agentic traces — "
+                        "rerun with DISTILL_BOXED_ONLY=1 to relax the structural check.",
+                        file=sys.stderr,
+                    )
+                    break
     finally:
         out_f.close()
         elapsed = time.time() - started

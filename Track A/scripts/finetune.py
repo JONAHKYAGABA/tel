@@ -32,6 +32,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
 )
@@ -86,13 +87,13 @@ def build_text(rec: Dict[str, Any], system_prompt: str) -> Dict[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces", default="traces/train_traces.jsonl")
-    ap.add_argument("--output_dir", default="training/checkpoints/run_v1")
+    ap.add_argument("--output_dir", default="training/checkpoints/agentic_lora")
     ap.add_argument("--base_model", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
     ap.add_argument("--val_size", type=int, default=200)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--per_device_batch_size", type=int, default=1)
     ap.add_argument("--grad_accum", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--lora_r", type=int, default=32)
     ap.add_argument("--lora_alpha", type=int, default=64)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
@@ -194,6 +195,9 @@ def main() -> int:
         }
 
     # ---------- training args ----------
+    # r=32 + 2000 examples + 3 epochs can overfit. Stronger regularisation
+    # (weight_decay=0.05) + early stopping on eval_loss with patience=1 means
+    # if epoch 2 worsens eval_loss we revert to epoch-1 weights.
     targs = TrainingArguments(
         output_dir=str(out),
         num_train_epochs=args.epochs if not args.smoke else 1,
@@ -213,10 +217,16 @@ def main() -> int:
         save_total_limit=2,
         load_best_model_at_end=not args.smoke,
         metric_for_best_model="eval_loss" if not args.smoke else None,
+        greater_is_better=False,
+        weight_decay=0.05,
         report_to=[],
         seed=args.seed,
         max_steps=5 if args.smoke else -1,
     )
+
+    callbacks = []
+    if not args.smoke:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=1))
 
     trainer = Trainer(
         model=model,
@@ -224,6 +234,7 @@ def main() -> int:
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collate,
+        callbacks=callbacks,
     )
 
     print("[finetune] starting training...")

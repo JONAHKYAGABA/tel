@@ -440,6 +440,39 @@ sleep 3
 start_llm_parallel || { c_red "llm_server (parallel) failed"; exit 1; }
 ensure_tool_server || c_yel "  tool server unavailable (agent will run without tool execution)"
 
+# ============ C+. one-time k-NN cache for few-shot retrieval =======
+# Builds embeddings of every labelled training scenario so the agentic agent
+# can retrieve the top-k most similar examples as in-prompt few-shot context.
+KNN_CACHE="knowledge/processed/train_knn_cache.npz"
+if [ "$AGENT_USE_FEWSHOT" = "1" ] || [ "$ENSEMBLE_HYBRID" = "1" ]; then
+    if [ ! -f "$KNN_CACHE" ]; then
+        step "C+. Build k-NN embedding cache from train.json (one-time, ~5 min)"
+        mkdir -p knowledge/processed
+        ./.venv/bin/python -c "
+from scripts.agentic_agent import _knn_init
+_knn_init('data/Phase_1/train.json', '$KNN_CACHE')" \
+            || c_red "  knn cache build failed (sentence-transformers missing?)"
+    else
+        c_yel "C+. k-NN cache exists at $KNN_CACHE — skipping"
+    fi
+fi
+
+# Agentic-improved flags are passed to every Phase F/K/M/O agent invocation
+# when AGENT_USE_FEWSHOT=1 / AGENT_USE_HEUR_COLLAB=1. AGENT_MIN_TOOLS adds a
+# confidence penalty if the LLM emits fewer than N tool calls.
+AGENT_EXTRA_FLAGS=""
+[ "$AGENT_USE_FEWSHOT" = "1" ]      && AGENT_EXTRA_FLAGS="$AGENT_EXTRA_FLAGS --use_fewshot --fewshot_k ${AGENT_FEWSHOT_K:-3}"
+[ "$AGENT_USE_HEUR_COLLAB" = "1" ]  && AGENT_EXTRA_FLAGS="$AGENT_EXTRA_FLAGS --use_heur_collab"
+[ -n "$AGENT_MIN_TOOLS" ] && [ "$AGENT_MIN_TOOLS" != "0" ] && \
+    AGENT_EXTRA_FLAGS="$AGENT_EXTRA_FLAGS --min_tools $AGENT_MIN_TOOLS"
+if [ -n "$AGENT_EXTRA_FLAGS" ]; then
+    c_green "  agentic-improved flags active: $AGENT_EXTRA_FLAGS"
+fi
+# Tool calls per scenario — bump to 4 in agentic-improved mode so the agent
+# can chain pathloss + mainlobe checks before answering.
+AGENT_MAX_TOOL_CALLS="${AGENT_MAX_TOOL_CALLS:-1}"
+[ "$AGENT_USE_HEUR_COLLAB" = "1" ] && AGENT_MAX_TOOL_CALLS=4
+
 # ============ D. holdout split =====================================
 step "D. Build stratified 1800/200 holdout"
 if [ -f "$TRAIN_FOLD" ] && [ -f "$HOLDOUT" ]; then
@@ -497,8 +530,10 @@ else
             --out_dir   eval/results/agentic_holdout \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
-            --scenario_timeout_s 480 2>&1 | tee eval/results/agentic_holdout.log
+            $AGENT_EXTRA_FLAGS \
+            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --llm_timeout_s 300 --scenario_timeout_s 480 \
+            2>&1 | tee eval/results/agentic_holdout.log
     fi
     SCORE_BASE=$(extract_score eval/results/agentic_holdout.log)
     c_green "  baseline holdout: ${SCORE_BASE:-?}"
@@ -590,11 +625,36 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --out_dir   eval/results/holdout_lora \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
-            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_lora.log
+            $AGENT_EXTRA_FLAGS \
+            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --llm_timeout_s 300 --scenario_timeout_s 480 \
+            2>&1 | tee eval/results/holdout_lora.log
     fi
     SCORE_LORA=$(extract_score eval/results/holdout_lora.log)
     c_green "  LoRA holdout: ${SCORE_LORA:-?}"
+fi
+
+# ============ K+. hybrid ensemble holdout (4-source fusion) ========
+# Only runs when the agentic-improved flags are active AND a LoRA holdout
+# completions.jsonl is on disk. Tunes weights against the labelled holdout
+# and writes both the tuned hybrid CSV and the per-decision log.
+SCORE_HYBRID=""
+if [ "$ENSEMBLE_HYBRID" = "1" ] && [ -f eval/results/holdout_lora/completions.jsonl ]; then
+    step "K+. Hybrid 4-source ensemble holdout (agent + k-NN + LoRA + heuristic)"
+    rm -rf eval/results/ensemble_holdout
+    AGENT_FEWSHOT_TRAIN="data/Phase_1/train.json" \
+    AGENT_FEWSHOT_CACHE="$KNN_CACHE" \
+    ./.venv/bin/python scripts/submit_ensemble.py \
+        --llm_completions eval/results/agentic_holdout/completions.jsonl \
+        --lora_completions eval/results/holdout_lora/completions.jsonl \
+        --test_file       "$HOLDOUT" \
+        --out_dir         eval/results/ensemble_holdout \
+        --hybrid \
+        --tune_weights    "$HOLDOUT" \
+        --trust_threshold 0.75 --min_tools 2 --knn_k 10 \
+        2>&1 | tee eval/results/ensemble_holdout.log || c_red "  ensemble holdout failed"
+    SCORE_HYBRID=$(grep -oE 'HYBRID mean IoU = [0-9.]+' eval/results/ensemble_holdout.log | tail -1 | awk '{print $NF}')
+    c_green "  hybrid holdout: ${SCORE_HYBRID:-?}"
 fi
 
 # ============ L. RAG knowledge base ================================
@@ -631,8 +691,10 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
-            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
-            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_lora_rag.log
+            $AGENT_EXTRA_FLAGS \
+            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --llm_timeout_s 300 --scenario_timeout_s 480 \
+            2>&1 | tee eval/results/holdout_lora_rag.log
     fi
     SCORE_LORA_RAG=$(extract_score eval/results/holdout_lora_rag.log)
     c_green "  LoRA+RAG holdout: ${SCORE_LORA_RAG:-?}"
@@ -659,8 +721,10 @@ if [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
-            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
-            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_rag.log
+            $AGENT_EXTRA_FLAGS \
+            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --llm_timeout_s 300 --scenario_timeout_s 480 \
+            2>&1 | tee eval/results/holdout_rag.log
     fi
     SCORE_RAG=$(extract_score eval/results/holdout_rag.log)
     c_green "  RAG-only holdout: ${SCORE_RAG:-?}"
@@ -679,11 +743,13 @@ choose "baseline" "$SCORE_BASE"
 choose "RAG"      "$SCORE_RAG"
 choose "LoRA"     "$SCORE_LORA"
 choose "LoRA+RAG" "$SCORE_LORA_RAG"
+choose "HYBRID"   "$SCORE_HYBRID"
 
 echo "  baseline    : ${SCORE_BASE:-?}"
 echo "  RAG         : ${SCORE_RAG:-?}"
 echo "  LoRA        : ${SCORE_LORA:-?}"
 echo "  LoRA+RAG    : ${SCORE_LORA_RAG:-?}"
+echo "  HYBRID      : ${SCORE_HYBRID:-?}"
 c_green "  WINNER -> $BEST_LABEL (score=${BEST_SCORE:-?})"
 
 # Ensure llm_server matches winning config (parallel launch in either case)
@@ -714,12 +780,35 @@ case "$BEST_LABEL" in
     RAG)      FINAL_DIR="eval/results/final_rag" ;;
     LoRA)     FINAL_DIR="eval/results/final_lora" ;;
     LoRA+RAG) FINAL_DIR="eval/results/final_lora_rag" ;;
+    HYBRID)   FINAL_DIR="eval/results/final_hybrid" ;;
     *)        FINAL_DIR="eval/results/final" ;;
 esac
 
 if [ "$SKIP_FINAL" = "1" ]; then
     c_yel "O. SKIP_FINAL=1 — not running on test set"
 else
+    # O-. Tool-server pre-flight: don't burn 500 scenarios if the cloud sandbox
+    # is unreachable. Retry up to 3× with backoff. 401/403 mean "alive but
+    # auth-gated" and is also OK because the per-scenario calls send X-API-Token.
+    step "O-. Tool-server pre-flight ($TOOL_URL)"
+    tool_ok=0
+    for attempt in 1 2 3; do
+        code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
+            ${TOOL_BEARER_TOKEN:+-H "X-API-Token: $TOOL_BEARER_TOKEN"} \
+            ${TOOL_BEARER_TOKEN:+-H "Authorization: Bearer $TOOL_BEARER_TOKEN"} \
+            -k "$TOOL_URL/tools" 2>/dev/null || echo 000)
+        if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ]; then
+            c_green "  tool server healthy (HTTP $code) on attempt $attempt"
+            tool_ok=1
+            break
+        fi
+        c_yel "  tool server returned HTTP $code on attempt $attempt — retrying in 10s..."
+        sleep 10
+    done
+    if [ "$tool_ok" != "1" ]; then
+        c_red "  tool server unreachable after 3 attempts — agent will fall back to heuristic for most scenarios"
+    fi
+
     step "O. Final run on $TEST_FILE  (output: $FINAL_DIR  config=$BEST_LABEL)"
     if [ -f "$FINAL_DIR/result.csv" ] && \
        [ "$(wc -l < "$FINAL_DIR/result.csv")" -ge 500 ]; then
@@ -732,8 +821,38 @@ else
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             $RAG_FLAG \
-            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
-            --scenario_timeout_s 480 2>&1 | tee "${FINAL_DIR}.log"
+            $AGENT_EXTRA_FLAGS \
+            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --llm_timeout_s 300 --scenario_timeout_s 480 \
+            2>&1 | tee "${FINAL_DIR}.log"
+    fi
+
+    # When the hybrid ensemble won, also post-process the test completions
+    # through submit_ensemble.py to produce the fused CSV. Uses the weights
+    # tuned in Phase K+ (eval/results/ensemble_holdout/weights.json).
+    if [ "$BEST_LABEL" = "HYBRID" ] && [ -f "$FINAL_DIR/completions.jsonl" ]; then
+        step "O+. Apply hybrid fusion to test completions"
+        TUNED_WEIGHTS_JSON="eval/results/ensemble_holdout/weights.json"
+        W_AGENT=0.4; W_KNN=0.3; W_LORA=0.2; W_HEUR=0.1
+        if [ -f "$TUNED_WEIGHTS_JSON" ]; then
+            read W_AGENT W_KNN W_LORA W_HEUR < <(python -c "
+import json
+w = json.load(open('$TUNED_WEIGHTS_JSON')).get('weights', {})
+print(w.get('agent', 0.4), w.get('knn', 0.3), w.get('lora', 0.2), w.get('heur', 0.1))
+")
+        fi
+        c_green "  hybrid weights: agent=$W_AGENT knn=$W_KNN lora=$W_LORA heur=$W_HEUR"
+        AGENT_FEWSHOT_TRAIN="data/Phase_1/train.json" \
+        AGENT_FEWSHOT_CACHE="$KNN_CACHE" \
+        ./.venv/bin/python scripts/submit_ensemble.py \
+            --llm_completions "$FINAL_DIR/completions.jsonl" \
+            --lora_completions "$FINAL_DIR/completions.jsonl" \
+            --test_file       "$TEST_FILE" \
+            --out_dir         "$FINAL_DIR/hybrid" \
+            --hybrid \
+            --trust_threshold 0.75 --min_tools 2 --knn_k 10 \
+            --w_agent "$W_AGENT" --w_knn "$W_KNN" --w_lora "$W_LORA" --w_heur "$W_HEUR" \
+            2>&1 | tee "${FINAL_DIR}/hybrid.log" || c_red "  hybrid test fusion failed"
     fi
 fi
 
@@ -746,20 +865,32 @@ if [ -d "$FINAL_DIR" ]; then
         fi
     done
 fi
+# Hybrid CSV is already in Zindi format (written by submit_ensemble.py).
+# Copy it to a discoverable name alongside the agentic CSV.
+if [ -f "$FINAL_DIR/hybrid/result_hybrid_zindi.csv" ]; then
+    cp "$FINAL_DIR/hybrid/result_hybrid_zindi.csv" "$FINAL_DIR/result_hybrid_zindi.csv"
+    c_green "  copied hybrid CSV to $FINAL_DIR/result_hybrid_zindi.csv"
+fi
 
 # ============ Q. summary ===========================================
 step "Q. DONE"
 echo
 echo "Holdout scores:"
 echo "  baseline   : ${SCORE_BASE:-?}"
+echo "  RAG        : ${SCORE_RAG:-?}"
 echo "  LoRA       : ${SCORE_LORA:-?}"
 echo "  LoRA+RAG   : ${SCORE_LORA_RAG:-?}"
+echo "  HYBRID     : ${SCORE_HYBRID:-?}"
 echo "  WINNER     : $BEST_LABEL (${BEST_SCORE:-?})"
 echo
-c_green "Phase 2 submission candidates (best of 3 counted by Zindi):"
-echo "  1) $FINAL_DIR/result_v1_raw_zindi.csv            # winner: $BEST_LABEL"
-echo "  2) $FINAL_DIR/result_v2_multi_recall_zindi.csv   # winner: $BEST_LABEL (alt)"
-echo "  3) eval/results/heuristic_baseline/result_v1_raw_zindi.csv  # safety net"
+c_green "Phase 2 submission candidates (Zindi accepts 3; best is counted):"
+echo "  1) eval/results/heuristic_baseline/result_v1_raw_zindi.csv  # SAFETY NET (~0.30)"
+echo "  2) $FINAL_DIR/result_v1_raw_zindi.csv            # AGENTIC: winner=$BEST_LABEL (code-review defensible)"
+if [ -f "$FINAL_DIR/result_hybrid_zindi.csv" ]; then
+    echo "  3) $FINAL_DIR/result_hybrid_zindi.csv            # HYBRID FUSION (agent+kNN+LoRA+heur)"
+else
+    echo "  3) $FINAL_DIR/result_v2_multi_recall_zindi.csv   # AGENTIC alt"
+fi
 echo
 ls -la "$FINAL_DIR/result_"*_zindi.csv 2>/dev/null
 ls -la eval/results/heuristic_baseline/result_v1_raw_zindi.csv 2>/dev/null

@@ -235,6 +235,39 @@ def pick_answer(scenario: Dict[str, Any]) -> str:
     return options[0]["id"] if options else ""
 
 
+def heuristic_diagnosis(scenario: Dict[str, Any]) -> Dict[str, Any]:
+    """Single-call diagnostic helper exported for the agent's prompt.
+
+    Reuses parse_table + find_drop + classify_mode + pick_answer + is_multi.
+    Returns the failure mode, RSRP/SINR deltas, picked answer, and a naive
+    confidence in [0, 1] derived from the magnitude of the deltas.
+    """
+    up = (scenario.get("data") or {}).get("user_plane_data", "") or ""
+    diag = find_drop(parse_table(up))
+    mode = classify_mode(diag)
+    answer = pick_answer(scenario)
+    multi = is_multi(scenario)
+    rd = float(diag["rsrp_delta"]) if diag else 0.0
+    sd = float(diag["sinr_delta"]) if diag else 0.0
+    if mode in ("AMBIG", "NO_DROP"):
+        conf = 0.3
+    elif mode == "COVERAGE":
+        conf = min(0.5 + 0.05 * max(rd - 6.0, 0.0), 0.9)
+    elif mode.startswith("INTERFERENCE"):
+        conf = min(0.5 + 0.05 * max(sd - 5.0, 0.0), 0.9)
+    else:  # SCHEDULER or unknown
+        conf = 0.6
+    return {
+        "failure_mode": mode,
+        "delta_rsrp_db": rd,
+        "delta_sinr_db": sd,
+        "is_multi": multi,
+        "confidence": float(conf),
+        "recommended_answer": answer,
+        "reasoning": f"{mode}: RSRP Δ={rd:.1f}dB, SINR Δ={sd:.1f}dB",
+    }
+
+
 # ------------------------------------------------------------------------- main
 
 def _score_match(pred: str, gt: str) -> float:
