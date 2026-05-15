@@ -834,10 +834,25 @@ def _format_question(scenario: Dict[str, Any], rag_block: str = "",
     options_block = "\n".join(f"  {o['id']}: {o['label']}" for o in options if "id" in o)
     task_desc = (scenario.get("task") or {}).get("description") or ""
     data_block = _truncate_scenario(scenario)
+    is_multi_task = task_is_multi(scenario)
     parts = []
-    # Order: heuristic (decision-relevant tool output) → fewshot (calibration
-    # examples) → rag (3GPP background) → scenario data → task → options.
-    # This puts the most concrete signals nearest the LLM's recency window.
+
+    # LOUD multi-answer banner at the TOP so the model can't miss it.
+    # During Phase F audits, 4/5 multi-answer scenarios still got single-Cx
+    # outputs because the multi distinction was buried in the system prompt.
+    if is_multi_task:
+        parts.append(
+            "⚠️ MULTI-ANSWER TASK — REQUIRED FORMAT\n"
+            "This task requires you to select TWO TO FOUR options.\n"
+            "Single-option answers (e.g. \"answer\":\"C7\") will be auto-rejected\n"
+            "and scored ZERO. Output 2-4 Cx IDs in ascending order, pipe-separated:\n"
+            "    {\"answer\": \"C3|C9|C12\", ...}   ← REQUIRED for this task\n"
+            "    \\boxed{C3|C9|C12}                  ← legacy fallback\n"
+            "Read the heuristic suggestion below — it usually has the right shape."
+        )
+
+    # Order: [multi banner] → heuristic → fewshot → rag → scenario → task → options.
+    # The most decision-relevant content is nearest the LLM's recency window.
     if heur_block:
         parts.append(heur_block)
     if fewshot_block:
@@ -847,7 +862,9 @@ def _format_question(scenario: Dict[str, Any], rag_block: str = "",
     parts.append(data_block)
     parts.append(f"## Task\n{task_desc}")
     parts.append(f"## Options\n{options_block}")
-    parts.append("Final answer (JSON preferred, see system prompt):")
+    # NO trailing "Final answer:" footer — it invites skip-to-answer and was
+    # observed to suppress all tool calls in the Phase F audit. The system
+    # prompt's diagnostic protocol already specifies the format.
     return "\n\n".join(parts)
 
 
@@ -951,6 +968,7 @@ def _agent_turn(
     use_fewshot: bool = False,
     fewshot_k: int = 3,
     use_heur_collab: bool = False,
+    min_tools_floor: int = 0,
 ) -> Dict[str, Any]:
     """
     Agentic loop for one scenario. Up to `max_tool_calls` tool calls + 1
@@ -992,6 +1010,9 @@ def _agent_turn(
     ]
 
     tool_calls_made: List[Dict[str, Any]] = []
+    required_tools = _required_min_tools(scenario, floor=min_tools_floor)
+    push_back_count = 0
+    MAX_PUSHBACK = 1  # push back at most once; avoid infinite skirmish
 
     for turn in range(max_tool_calls):
         msg = _call_llm(messages, llm_url, model_name, timeout_s, max_tokens, tools=tool_defs)
@@ -1001,9 +1022,38 @@ def _agent_turn(
         tcs = msg.get("tool_calls") or []
         text = msg.get("content") or ""
 
-        # If model produced a final answer (JSON or \boxed{}) with no tool calls, we're done.
+        # If model tries to finalize but we haven't called the required number
+        # of tools yet, push back ONCE with a directive to call a tool first.
+        # The Phase F audit showed 100% of LLM responses skipped tools and went
+        # straight to a final answer — this is the lever that fixes that.
+        if (not tcs and _looks_final(text)
+                and len(tool_calls_made) < required_tools
+                and push_back_count < MAX_PUSHBACK):
+            push_back_count += 1
+            messages.append({"role": "assistant", "content": text})
+            need = required_tools - len(tool_calls_made)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"You skipped the tool-calling step. Before your final answer "
+                    f"you MUST call at least {need} tool(s) to verify the heuristic "
+                    "diagnosis. Examples:\n"
+                    "  • For COVERAGE: <tool_call>{\"name\": \"calculate_pathloss\", "
+                    "\"arguments\": {\"time\": \"<t_drop>\", \"pci\": <serving_pci>}}</tool_call>\n"
+                    "  • For INTERFERENCE: <tool_call>{\"name\": \"calculate_overlap_ratio\", "
+                    "\"arguments\": {\"pci_serving\": <serv>, \"pci_neighbor\": <neigh>}}</tool_call>\n"
+                    "Emit ONE <tool_call>...</tool_call> block now and STOP — wait for the "
+                    "tool's result before deciding."
+                ),
+            })
+            continue
+
+        # If model produced a final answer (JSON or \boxed{}) and tools quota
+        # is satisfied, we're done.
         if not tcs and _looks_final(text):
-            return {"text": text, "tool_calls_made": tool_calls_made, "num_tool_calls": len(tool_calls_made)}
+            return {"text": text, "tool_calls_made": tool_calls_made,
+                    "num_tool_calls": len(tool_calls_made),
+                    "heuristic_suggestion": (heuristic_diagnosis(scenario) if use_heur_collab else None)}
 
         if not tcs:
             # No tool, no final answer — break to the explicit final-answer turn
@@ -1263,6 +1313,7 @@ def main() -> int:
                     args.model_name, args.llm_timeout_s, args.max_tokens,
                     args.max_tool_calls, rag_active_k,
                     fewshot_active, args.fewshot_k, args.use_heur_collab,
+                    args.min_tools,
                 )
                 try:
                     res = fut.result(timeout=args.scenario_timeout_s)
@@ -1279,6 +1330,22 @@ def main() -> int:
 
         source = "llm"
         source_format = parsed.get("source_format", "none") if parsed else "none"
+
+        # Multi-answer auto-recovery. Phase F holdout showed the LLM emits a
+        # single Cx on ~85% of multi-answer tasks (0/29 perfect IoU). When
+        # the scoring task is multi but the model produced one option, merge
+        # the model's pick with the heuristic's pipe-separated answer so we
+        # at least claim partial overlap with ground truth.
+        if answer and task_is_multi(scenario) and "|" not in answer:
+            heur_multi = heuristic_pick(scenario)
+            if "|" in heur_multi:
+                merged_set = set(answer.split("|")) | set(heur_multi.split("|"))
+                merged_set = {c for c in merged_set if c in valid_ids}
+                if len(merged_set) >= 2:
+                    answer = "|".join(sorted(merged_set,
+                                             key=lambda c: int(re.search(r"\d+", c).group())))
+                    source_format = f"{source_format}+multi_recovered"
+
         if not answer:
             answer = heuristic_pick(scenario)
             source = "heuristic"
