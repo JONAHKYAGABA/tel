@@ -106,6 +106,7 @@ wait_health() {
 }
 
 start_llm_server() {
+    # Single-instance launcher (used for distillation / LoRA stage where one is enough)
     pkill -f "scripts/llm_server.py" 2>/dev/null || true
     sleep 5
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -113,6 +114,63 @@ start_llm_server() {
         > "$LLM_LOG" 2>&1 &
     echo "  llm pid=$!"
     wait_health "http://localhost:$LLM_PORT/health" 1200 || return 1
+}
+
+start_llm_parallel() {
+    # Multi-instance launcher: ONE llm_server per visible GPU on distinct ports.
+    # Each loads the FULL 4-bit model on its own GPU (35B-A3B ~22 GB fits on 48 GB card).
+    # Exports LLM_URLS (comma-sep) + AGENT_WORKERS for the agent.
+    local extra_args=("$@")
+    pkill -f "scripts/llm_server.py" 2>/dev/null || true
+    sleep 5
+
+    local n_gpus
+    n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "${n_gpus:-0}" -le 1 ]; then
+        echo "  only ${n_gpus:-0} GPU(s) — falling back to single-instance"
+        start_llm_server "${extra_args[@]}" || return 1
+        export LLM_URLS="http://localhost:$LLM_PORT"
+        export AGENT_WORKERS=1
+        return 0
+    fi
+
+    local urls=""
+    local g
+    for ((g=0; g<n_gpus; g++)); do
+        local port=$((LLM_PORT + g))
+        local glog="eval/logs/run_all/llm_server_gpu${g}.log"
+        echo "  starting llm_server on GPU $g (port $port)"
+        CUDA_VISIBLE_DEVICES=$g \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        nohup python scripts/llm_server.py \
+              --model "$MODEL_NAME" --port "$port" "${extra_args[@]}" \
+              > "$glog" 2>&1 &
+        echo "    pid=$!  log=$glog"
+        if [ -z "$urls" ]; then
+            urls="http://localhost:$port"
+        else
+            urls="$urls,http://localhost:$port"
+        fi
+    done
+
+    local any_ok=0
+    for ((g=0; g<n_gpus; g++)); do
+        local port=$((LLM_PORT + g))
+        if wait_health "http://localhost:$port/health" 1500; then
+            any_ok=1
+        else
+            c_red "  GPU $g llm_server NOT healthy (port $port)"
+            tail -n 40 "eval/logs/run_all/llm_server_gpu${g}.log" >&2 || true
+        fi
+    done
+    if [ "$any_ok" != "1" ]; then
+        c_red "  no llm_server became healthy"
+        return 1
+    fi
+    export LLM_URLS="$urls"
+    export AGENT_WORKERS="$n_gpus"
+    c_green "  LLM_URLS=$LLM_URLS  AGENT_WORKERS=$AGENT_WORKERS"
+    return 0
 }
 
 ensure_tool_server() {
@@ -251,12 +309,11 @@ print(f'  scenarios={len(t)}  first_id={t[0][\"scenario_id\"][:8]}')
 esac
 
 # ============ C. start servers =====================================
-step "C. Start llm_server on :$LLM_PORT and tool server on :$TOOL_PORT"
-if curl -sf "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
-    c_yel "  llm_server already healthy"
-else
-    start_llm_server || { c_red "llm_server failed"; tail -n 40 "$LLM_LOG" >&2; exit 1; }
-fi
+step "C. Start llm_server on EACH GPU (parallel inference) + tool server on :$TOOL_PORT"
+# Always restart in parallel mode so both GPUs are used.
+pkill -f "scripts/llm_server.py" 2>/dev/null || true
+sleep 3
+start_llm_parallel || { c_red "llm_server (parallel) failed"; exit 1; }
 ensure_tool_server || c_yel "  tool server unavailable (agent will run without tool execution)"
 
 # ============ D. holdout split =====================================
@@ -314,7 +371,7 @@ else
         python scripts/agentic_agent.py \
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/agentic_holdout \
-            --llm_url   "http://localhost:$LLM_PORT" \
+            --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --max_tokens 256 --max_tool_calls 1 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/agentic_holdout.log
@@ -401,7 +458,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
         python scripts/agentic_agent.py \
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/holdout_lora \
-            --llm_url   "http://localhost:$LLM_PORT" \
+            --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --max_tokens 256 --max_tool_calls 1 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora.log
@@ -443,7 +500,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
         python scripts/agentic_agent.py \
             --test_file "$HOLDOUT" \
             --out_dir   eval/results/holdout_lora_rag \
-            --llm_url   "http://localhost:$LLM_PORT" \
+            --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --max_tokens 256 --max_tool_calls 1 \
             --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora_rag.log
@@ -502,7 +559,7 @@ else
         python scripts/agentic_agent.py \
             --test_file "$TEST_FILE" \
             --out_dir   "$FINAL_DIR" \
-            --llm_url   "http://localhost:$LLM_PORT" \
+            --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --max_tokens 256 --max_tool_calls 1 \
             --scenario_timeout_s 120 2>&1 | tee "${FINAL_DIR}.log"

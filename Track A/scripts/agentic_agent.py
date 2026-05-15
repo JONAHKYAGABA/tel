@@ -427,6 +427,10 @@ def main() -> int:
     ap.add_argument("--test_file", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--llm_url", default=os.environ.get("LLM_URL", "http://localhost:8001"))
+    ap.add_argument("--llm_urls", default=os.environ.get("LLM_URLS"),
+                    help="Comma-separated list of LLM URLs for parallel inference "
+                         "(one per GPU). Overrides --llm_url. e.g. "
+                         "'http://localhost:8001,http://localhost:8002'")
     ap.add_argument("--tool_url", default=os.environ.get("TOOL_URL", "http://localhost:7860"))
     ap.add_argument("--model_name", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
     ap.add_argument("--max_tokens", type=int, default=256)
@@ -435,7 +439,20 @@ def main() -> int:
     ap.add_argument("--max_samples", type=int, default=None)
     ap.add_argument("--max_tool_calls", type=int, default=1,
                     help="Max number of tool-call turns per scenario before forcing final answer.")
+    ap.add_argument("--workers", type=int, default=int(os.environ.get("AGENT_WORKERS", "1")),
+                    help="Concurrent scenario workers. Set to len(llm_urls) for true GPU parallelism.")
     args = ap.parse_args()
+
+    # Resolve URL list: --llm_urls (comma-sep) overrides --llm_url
+    if args.llm_urls:
+        llm_urls = [u.strip() for u in args.llm_urls.split(",") if u.strip()]
+    else:
+        llm_urls = [args.llm_url]
+    if args.workers < 1:
+        args.workers = 1
+    # Cap workers to number of URLs (one worker per LLM instance)
+    args.workers = min(args.workers, len(llm_urls))
+    print(f"[run] llm_urls = {llm_urls}  workers = {args.workers}")
 
     test_path = (PROJECT_DIR / args.test_file).resolve()
     out_dir = (PROJECT_DIR / args.out_dir).resolve()
@@ -447,23 +464,41 @@ def main() -> int:
         print(f"FATAL: {test_path} not found", file=sys.stderr)
         return 1
 
-    # Health checks
-    llm_ok = False
-    try:
-        h = requests.get(f"{args.llm_url}/health", timeout=5).json()
-        llm_ok = h.get("status") == "ok"
-        print(f"[llm] {args.llm_url} -> {h}")
-    except Exception as exc:
-        print(f"[llm] not reachable: {exc}", file=sys.stderr)
+    # Health checks for ALL llm_urls (one per GPU)
+    healthy_urls: List[str] = []
+    for url in llm_urls:
+        try:
+            h = requests.get(f"{url}/health", timeout=5).json()
+            if h.get("status") == "ok":
+                healthy_urls.append(url)
+                print(f"[llm] {url} -> {h}")
+            else:
+                print(f"[llm] {url} not ok: {h}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[llm] {url} not reachable: {exc}", file=sys.stderr)
+    llm_ok = len(healthy_urls) > 0
+    if not llm_ok:
+        print("[run] NO LLMs reachable — all answers will be heuristic fallback", file=sys.stderr)
+        healthy_urls = llm_urls  # placeholder so loop has something
+    # Effective worker count = min(requested, healthy LLMs)
+    eff_workers = min(args.workers, max(len(healthy_urls), 1)) if llm_ok else 1
+    print(f"[run] healthy LLMs: {len(healthy_urls)} | effective workers: {eff_workers}")
+
     tool_ok = False
     try:
-        r = requests.get(f"{args.tool_url}/health", timeout=5)
-        tool_ok = r.status_code == 200
+        r = requests.get(f"{args.tool_url}/health", timeout=5, verify=False)
+        tool_ok = r.status_code in (200, 401, 403)
         print(f"[tool] {args.tool_url} -> {r.status_code}")
     except Exception as exc:
-        print(f"[tool] not reachable: {exc}", file=sys.stderr)
-    if not llm_ok:
-        print("[run] LLM unreachable — all answers will be heuristic fallback", file=sys.stderr)
+        # Try with verify=False if not already
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            r = requests.get(f"{args.tool_url}/health", timeout=5, verify=False)
+            tool_ok = r.status_code in (200, 401, 403)
+            print(f"[tool] {args.tool_url} -> {r.status_code} (no-verify)")
+        except Exception as exc2:
+            print(f"[tool] not reachable: {exc2}", file=sys.stderr)
     if not tool_ok:
         print("[run] tool server unreachable — agent will run without tool execution", file=sys.stderr)
 
@@ -476,81 +511,114 @@ def main() -> int:
     rows: List[Dict[str, str]] = [
         {"scenario_id": sid, "answers": ans} for sid, ans in done.items()
     ]
+    pending = [s for s in scenarios if s.get("scenario_id") not in done]
     print(f"[run] {len(scenarios)} scenarios, {len(done)} already done, "
-          f"{len(scenarios) - len(done)} remaining")
+          f"{len(pending)} remaining")
 
-    n_llm = n_fb = n_done = n_with_tool = 0
+    # Counters + locks for parallel workers
+    import threading
+    counters_lock = threading.Lock()
+    write_lock = threading.Lock()
+    counters = {"llm": 0, "fb": 0, "tool_used": 0, "done": 0}
     f_jsonl = completions_path.open("a", encoding="utf-8")
     t_start = time.time()
-    try:
-        for i, scenario in enumerate(scenarios):
-            sid = scenario.get("scenario_id", "")
-            if sid in done:
-                continue
-            options = (scenario.get("task") or {}).get("options", []) or []
-            valid_ids = [o["id"] for o in options if "id" in o]
 
-            t0 = time.time()
-            llm_text = ""
-            tool_calls_made: List[Dict[str, Any]] = []
-            num_tool_calls = 0
-            answer = ""
+    def _process_one(scenario: Dict[str, Any], worker_idx: int) -> None:
+        """Process ONE scenario on the LLM URL assigned to this worker."""
+        sid = scenario.get("scenario_id", "")
+        options = (scenario.get("task") or {}).get("options", []) or []
+        valid_ids = [o["id"] for o in options if "id" in o]
+        url = healthy_urls[worker_idx % len(healthy_urls)]
 
-            if llm_ok:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(
-                        _agent_turn, scenario, args.llm_url, args.tool_url,
-                        args.model_name, args.llm_timeout_s, args.max_tokens,
-                        args.max_tool_calls,
-                    )
-                    try:
-                        res = fut.result(timeout=args.scenario_timeout_s)
-                        llm_text = res.get("text", "") or ""
-                        tool_calls_made = res.get("tool_calls_made", [])
-                        num_tool_calls = res.get("num_tool_calls", 0)
-                        if num_tool_calls > 0:
-                            n_with_tool += 1
-                        answer = _extract_boxed(llm_text, valid_ids)
-                    except concurrent.futures.TimeoutError:
-                        print(f"  [timeout] scenario {sid[:8]}", file=sys.stderr)
-                        fut.cancel()
+        t0 = time.time()
+        llm_text = ""
+        tool_calls_made: List[Dict[str, Any]] = []
+        num_tool_calls = 0
+        answer = ""
 
-            source = "llm"
-            if not answer:
-                answer = heuristic_pick(scenario)
-                source = "heuristic"
-                n_fb += 1
-            else:
-                n_llm += 1
+        if llm_ok:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(
+                    _agent_turn, scenario, url, args.tool_url,
+                    args.model_name, args.llm_timeout_s, args.max_tokens,
+                    args.max_tool_calls,
+                )
+                try:
+                    res = fut.result(timeout=args.scenario_timeout_s)
+                    llm_text = res.get("text", "") or ""
+                    tool_calls_made = res.get("tool_calls_made", [])
+                    num_tool_calls = res.get("num_tool_calls", 0)
+                    answer = _extract_boxed(llm_text, valid_ids)
+                except concurrent.futures.TimeoutError:
+                    print(f"  [timeout] scenario {sid[:8]} (worker={worker_idx})",
+                          file=sys.stderr)
+                    fut.cancel()
 
-            elapsed = time.time() - t0
-            rec = {
-                "scenario_id": sid,
-                "answer": answer,
-                "source": source,
-                "num_tool_calls": num_tool_calls,
-                "tool_calls": tool_calls_made,
-                "elapsed_s": round(elapsed, 2),
-                "llm_text_head": (llm_text or "")[:200],
-            }
+        source = "llm"
+        if not answer:
+            answer = heuristic_pick(scenario)
+            source = "heuristic"
+
+        elapsed = time.time() - t0
+        rec = {
+            "scenario_id": sid,
+            "answer": answer,
+            "source": source,
+            "worker": worker_idx,
+            "llm_url": url,
+            "num_tool_calls": num_tool_calls,
+            "tool_calls": tool_calls_made,
+            "elapsed_s": round(elapsed, 2),
+            "llm_text_head": (llm_text or "")[:200],
+        }
+
+        with write_lock:
             f_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
             f_jsonl.flush()
             rows.append({"scenario_id": sid, "answers": answer})
-            n_done += 1
-
-            if (i + 1) % 10 == 0 or (i + 1) == len(scenarios):
-                _write_csv(rows, csv_path)
+        with counters_lock:
+            if source == "llm":
+                counters["llm"] += 1
+            else:
+                counters["fb"] += 1
+            if num_tool_calls > 0:
+                counters["tool_used"] += 1
+            counters["done"] += 1
+            d = counters["done"]
             running = time.time() - t_start
-            avg = running / max(n_done, 1)
-            eta = avg * (len(scenarios) - len(done) - n_done)
+            avg = running / max(d, 1)
+            eta = avg * (len(pending) - d)
             print(
-                f"[{i+1:4d}/{len(scenarios)}] {sid[:8]} ans={answer:<18s} "
-                f"src={source:9s} tool={num_tool_calls} {elapsed:5.1f}s  "
-                f"(llm={n_llm} fb={n_fb} tool_used={n_with_tool}, eta={eta/60:.1f}min)"
+                f"[{d:4d}/{len(pending)}] {sid[:8]} ans={answer:<18s} "
+                f"src={source:9s} tool={num_tool_calls} {elapsed:5.1f}s "
+                f"w{worker_idx} url=...{url[-5:]}  "
+                f"(llm={counters['llm']} fb={counters['fb']} "
+                f"tool_used={counters['tool_used']}, eta={eta/60:.1f}min)",
+                flush=True,
             )
+            # Flush CSV every 10 completions
+            if d % 10 == 0 or d == len(pending):
+                _write_csv(rows, csv_path)
+
+    # Dispatch pending scenarios round-robin to workers (true GPU parallelism)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=eff_workers) as pool:
+            futures = []
+            for i, sc in enumerate(pending):
+                futures.append(pool.submit(_process_one, sc, i % eff_workers))
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    print(f"[worker-error] {exc}", file=sys.stderr)
     finally:
         f_jsonl.close()
         _write_csv(rows, csv_path)
+
+    # Pull counters back into local names for summary block
+    n_llm = counters["llm"]
+    n_fb = counters["fb"]
+    n_with_tool = counters["tool_used"]
 
     # Three Zindi-ready variants (identical for now; later we can diverge multi-recall)
     import pandas as pd
