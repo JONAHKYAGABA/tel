@@ -105,72 +105,71 @@ wait_health() {
     echo " ready"; return 0
 }
 
+start_llm_vllm() {
+    # PRIMARY launcher: vLLM with tensor-parallel + continuous batching.
+    # Provides ~5-10x throughput vs transformers+bnb pipeline-parallel.
+    # OpenAI-compatible API on $LLM_PORT, served by a single process spanning
+    # all visible GPUs via tensor parallelism.
+    local extra_args=("$@")
+    pkill -f "scripts/llm_server" 2>/dev/null || true
+    pkill -f "vllm.entrypoints" 2>/dev/null || true
+    sleep 5
+
+    local n_gpus
+    n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    [ "${n_gpus:-0}" -lt 1 ] && n_gpus=1
+    local tp="${TENSOR_PARALLEL_SIZE:-$n_gpus}"
+
+    local vllm_log="eval/logs/run_all/llm_server_vllm.log"
+    echo "  starting vLLM (tp=$tp, n_gpus=$n_gpus, port=$LLM_PORT)"
+    QUANT_MODE="${QUANT_MODE:-bitsandbytes}" \
+    TENSOR_PARALLEL_SIZE="$tp" \
+    GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}" \
+    MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}" \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    nohup python scripts/llm_server_vllm.py \
+          --model "$MODEL_NAME" --port "$LLM_PORT" \
+          --tp "$tp" "${extra_args[@]}" \
+          > "$vllm_log" 2>&1 &
+    echo "    pid=$!  log=$vllm_log"
+    # vLLM is OpenAI-compatible; health endpoint is /health on OpenAI server
+    if ! wait_health "http://localhost:$LLM_PORT/health" 1800; then
+        c_red "  vLLM never became healthy"
+        tail -n 80 "$vllm_log" >&2 || true
+        return 1
+    fi
+    export LLM_URLS="http://localhost:$LLM_PORT"
+    export AGENT_WORKERS="${AGENT_WORKERS:-8}"   # vLLM handles internal batching
+    c_green "  vLLM up: LLM_URLS=$LLM_URLS  AGENT_WORKERS=$AGENT_WORKERS (concurrent requests)"
+    return 0
+}
+
 start_llm_server() {
-    # Single-instance launcher (used for distillation / LoRA stage where one is enough)
+    # FALLBACK: single-instance transformers+bnb launcher.
+    # Used if USE_VLLM=0 or vLLM fails to start.
     pkill -f "scripts/llm_server.py" 2>/dev/null || true
+    pkill -f "vllm.entrypoints" 2>/dev/null || true
     sleep 5
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     nohup python scripts/llm_server.py --model "$MODEL_NAME" --port "$LLM_PORT" "$@" \
         > "$LLM_LOG" 2>&1 &
     echo "  llm pid=$!"
     wait_health "http://localhost:$LLM_PORT/health" 1200 || return 1
+    export LLM_URLS="http://localhost:$LLM_PORT"
+    export AGENT_WORKERS=1
+    return 0
 }
 
 start_llm_parallel() {
-    # Multi-instance launcher: ONE llm_server per visible GPU on distinct ports.
-    # Each loads the FULL 4-bit model on its own GPU (35B-A3B ~22 GB fits on 48 GB card).
-    # Exports LLM_URLS (comma-sep) + AGENT_WORKERS for the agent.
-    local extra_args=("$@")
-    pkill -f "scripts/llm_server.py" 2>/dev/null || true
-    sleep 5
-
-    local n_gpus
-    n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
-    if [ "${n_gpus:-0}" -le 1 ]; then
-        echo "  only ${n_gpus:-0} GPU(s) — falling back to single-instance"
-        start_llm_server "${extra_args[@]}" || return 1
-        export LLM_URLS="http://localhost:$LLM_PORT"
-        export AGENT_WORKERS=1
-        return 0
-    fi
-
-    local urls=""
-    local g
-    for ((g=0; g<n_gpus; g++)); do
-        local port=$((LLM_PORT + g))
-        local glog="eval/logs/run_all/llm_server_gpu${g}.log"
-        echo "  starting llm_server on GPU $g (port $port)"
-        CUDA_VISIBLE_DEVICES=$g \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        nohup python scripts/llm_server.py \
-              --model "$MODEL_NAME" --port "$port" "${extra_args[@]}" \
-              > "$glog" 2>&1 &
-        echo "    pid=$!  log=$glog"
-        if [ -z "$urls" ]; then
-            urls="http://localhost:$port"
-        else
-            urls="$urls,http://localhost:$port"
+    # Try vLLM first (single process, both GPUs via TP); fall back to
+    # bnb-transformers single-instance if vLLM fails or USE_VLLM=0.
+    if [ "${USE_VLLM:-1}" = "1" ]; then
+        if start_llm_vllm "$@"; then
+            return 0
         fi
-    done
-
-    local any_ok=0
-    for ((g=0; g<n_gpus; g++)); do
-        local port=$((LLM_PORT + g))
-        if wait_health "http://localhost:$port/health" 1500; then
-            any_ok=1
-        else
-            c_red "  GPU $g llm_server NOT healthy (port $port)"
-            tail -n 40 "eval/logs/run_all/llm_server_gpu${g}.log" >&2 || true
-        fi
-    done
-    if [ "$any_ok" != "1" ]; then
-        c_red "  no llm_server became healthy"
-        return 1
+        c_red "  vLLM start failed — falling back to transformers+bnb"
     fi
-    export LLM_URLS="$urls"
-    export AGENT_WORKERS="$n_gpus"
-    c_green "  LLM_URLS=$LLM_URLS  AGENT_WORKERS=$AGENT_WORKERS"
-    return 0
+    start_llm_server "$@"
 }
 
 ensure_tool_server() {
@@ -228,8 +227,8 @@ source .venv/bin/activate
 
 if [ "$SKIP_INSTALL" = "1" ]; then
     c_yel "  SKIP_INSTALL=1 — trusting current deps"
-elif python -c "import torch, transformers, peft, bitsandbytes, fastapi, pandas, sentence_transformers, trafilatura, datasets" >/dev/null 2>&1; then
-    c_yel "  all deps already present"
+elif python -c "import torch, transformers, peft, bitsandbytes, fastapi, pandas, sentence_transformers, trafilatura, datasets, vllm" >/dev/null 2>&1; then
+    c_yel "  all deps already present (incl. vllm)"
 else
     echo "  upgrading pip"
     pip install --upgrade -q pip wheel setuptools
@@ -248,6 +247,11 @@ else
 
     echo "  installing RAG deps"
     pip install -q sentence-transformers numpy trafilatura beautifulsoup4 pypdf 2>&1 | tail -2
+
+    if [ "${USE_VLLM:-1}" = "1" ]; then
+        echo "  installing vLLM (high-throughput inference; ~5 min)"
+        pip install -q "vllm>=0.6.0" 2>&1 | tail -3
+    fi
 
     c_green "  deps installed"
 fi
