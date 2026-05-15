@@ -69,9 +69,17 @@ def main() -> int:
         "--max-model-len", str(args.max_model_len),
         "--trust-remote-code",
         "--dtype", "float16",
-        # Note: newer vLLM uses --no-enable-log-requests; older uses --disable-log-requests.
-        # We omit the flag entirely — request logging is fine for diagnostics.
     ]
+
+    # Turing (compute capability 7.5, e.g. RTX 8000 / T4) compatibility:
+    # - Disable torch.compile + CUDAGraph (FA2 needs Ampere+; compile hangs without).
+    # - Disable Async scheduling (uses kernels that don't exist on Turing).
+    # Override via VLLM_TURING_COMPAT=0 if running on Ampere+.
+    if os.environ.get("VLLM_TURING_COMPAT", "1") == "1":
+        cmd += [
+            "--enforce-eager",
+            "--no-async-scheduling",
+        ]
 
     if quant == "bitsandbytes":
         # vLLM bnb support is gated on version. Newer vLLM rejects --load-format

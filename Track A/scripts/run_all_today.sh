@@ -121,11 +121,14 @@ start_llm_vllm() {
     local tp="${TENSOR_PARALLEL_SIZE:-$n_gpus}"
 
     local vllm_log="eval/logs/run_all/llm_server_vllm.log"
-    echo "  starting vLLM (tp=$tp, n_gpus=$n_gpus, port=$LLM_PORT)"
+    echo "  starting vLLM (tp=$tp, n_gpus=$n_gpus, port=$LLM_PORT, turing-compat=on)"
     QUANT_MODE="${QUANT_MODE:-bitsandbytes}" \
     TENSOR_PARALLEL_SIZE="$tp" \
     GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}" \
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}" \
+    VLLM_TURING_COMPAT="${VLLM_TURING_COMPAT:-1}" \
+    VLLM_USE_V1="${VLLM_USE_V1:-0}" \
+    VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     nohup python scripts/llm_server_vllm.py \
           --model "$MODEL_NAME" --port "$LLM_PORT" \
@@ -377,8 +380,8 @@ else
             --out_dir   eval/results/agentic_holdout \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 120 2>&1 | tee eval/results/agentic_holdout.log
+            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
+            --scenario_timeout_s 480 2>&1 | tee eval/results/agentic_holdout.log
     fi
     SCORE_BASE=$(extract_score eval/results/agentic_holdout.log)
     c_green "  baseline holdout: ${SCORE_BASE:-?}"
@@ -464,8 +467,8 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --out_dir   eval/results/holdout_lora \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
-            --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora.log
+            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
+            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_lora.log
     fi
     SCORE_LORA=$(extract_score eval/results/holdout_lora.log)
     c_green "  LoRA holdout: ${SCORE_LORA:-?}"
@@ -505,8 +508,8 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
-            --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 240 2>&1 | tee eval/results/holdout_lora_rag.log
+            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
+            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_lora_rag.log
     fi
     SCORE_LORA_RAG=$(extract_score eval/results/holdout_lora_rag.log)
     c_green "  LoRA+RAG holdout: ${SCORE_LORA_RAG:-?}"
@@ -533,8 +536,8 @@ if [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
-            --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 240 2>&1 | tee eval/results/holdout_rag.log
+            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
+            --scenario_timeout_s 480 2>&1 | tee eval/results/holdout_rag.log
     fi
     SCORE_RAG=$(extract_score eval/results/holdout_rag.log)
     c_green "  RAG-only holdout: ${SCORE_RAG:-?}"
@@ -606,8 +609,8 @@ else
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             $RAG_FLAG \
-            --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 240 2>&1 | tee "${FINAL_DIR}.log"
+            --max_tokens 384 --max_tool_calls 1 --llm_timeout_s 300 \
+            --scenario_timeout_s 480 2>&1 | tee "${FINAL_DIR}.log"
     fi
 fi
 
