@@ -684,8 +684,20 @@ _BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
 _CX_RE = re.compile(r"\bC\d+\b")
 
 
-def _truncate_scenario(scenario: Dict[str, Any], max_chars: int = 7500) -> str:
-    """Render scenario data with priority order. Drop low-value tables if oversize."""
+def _truncate_scenario(scenario: Dict[str, Any], max_chars: Optional[int] = None) -> str:
+    """Render scenario data with priority order. Drop low-value tables if oversize.
+
+    Pass `max_chars` explicitly or set AGENT_SCENARIO_MAX_CHARS env var.
+    Default 5000 chars (~1250 tokens). On a Turing GPU with the 35B model,
+    the self-attention prefill score matrix scales as O(seq_len²), so cutting
+    1000 input tokens drops peak attention memory by ~360 MB per layer.
+    Lower this (e.g. 3500) if you see CUDA OOMs at inference time.
+    """
+    if max_chars is None:
+        try:
+            max_chars = int(os.environ.get("AGENT_SCENARIO_MAX_CHARS", "5000"))
+        except ValueError:
+            max_chars = 5000
     d = scenario.get("data") or {}
     parts: List[str] = []
 

@@ -531,7 +531,7 @@ else
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             $AGENT_EXTRA_FLAGS \
-            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --max_tokens 256 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
             --llm_timeout_s 300 --scenario_timeout_s 480 \
             2>&1 | tee eval/results/agentic_holdout.log
     fi
@@ -626,7 +626,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
             $AGENT_EXTRA_FLAGS \
-            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --max_tokens 256 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
             --llm_timeout_s 300 --scenario_timeout_s 480 \
             2>&1 | tee eval/results/holdout_lora.log
     fi
@@ -692,7 +692,7 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
             $AGENT_EXTRA_FLAGS \
-            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --max_tokens 256 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
             --llm_timeout_s 300 --scenario_timeout_s 480 \
             2>&1 | tee eval/results/holdout_lora_rag.log
     fi
@@ -722,7 +722,7 @@ if [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
             --tool_url  "$TOOL_URL" \
             --use_rag --rag_k 3 \
             $AGENT_EXTRA_FLAGS \
-            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --max_tokens 256 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
             --llm_timeout_s 300 --scenario_timeout_s 480 \
             2>&1 | tee eval/results/holdout_rag.log
     fi
@@ -822,7 +822,7 @@ else
             --tool_url  "$TOOL_URL" \
             $RAG_FLAG \
             $AGENT_EXTRA_FLAGS \
-            --max_tokens 512 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
+            --max_tokens 256 --max_tool_calls $AGENT_MAX_TOOL_CALLS \
             --llm_timeout_s 300 --scenario_timeout_s 480 \
             2>&1 | tee "${FINAL_DIR}.log"
     fi
