@@ -221,19 +221,74 @@ start_llm_dual_bnb() {
     return 0
 }
 
+start_llm_single_dual_gpu() {
+    # ONE server, BOTH GPUs visible (pipeline parallel inside one process).
+    # Needed because transformers >= 4.50 materializes fp16 weights to the
+    # target device BEFORE bnb quantizes them. For a 35B model that's ~70 GB
+    # peak — exceeds a single 48 GB card mid-load even though the final 4-bit
+    # weights are only ~20 GB.
+    #
+    # With both GPUs visible (96 GB combined), the fp16 materialization fits,
+    # bnb quantizes in place, and the final ~20 GB model is split across the
+    # two cards (~10 GB each) leaving ~38 GB headroom per GPU for activations
+    # and KV cache.
+    pkill -f "scripts/llm_server.py" 2>/dev/null || true
+    pkill -f "vllm.entrypoints"       2>/dev/null || true
+    sleep 5
+
+    local n_gpus
+    n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "${n_gpus:-0}" -le 1 ]; then
+        echo "  only ${n_gpus:-0} GPU(s) — falling back to single-instance"
+        start_llm_server "$@" || return 1
+        return 0
+    fi
+
+    local glog="eval/logs/run_all/llm_server_dual.log"
+    echo "  starting llm_server with BOTH GPUs visible (port $LLM_PORT, pipeline parallel)"
+    # No CUDA_VISIBLE_DEVICES → both GPUs visible. LLM_PER_GPU_GIB sets the
+    # accelerate budget on each card. 42 GiB × 2 = 84 GiB > 70 GiB fp16, so
+    # no CPU spill is needed during load.
+    LLM_PER_GPU_GIB="${LLM_PER_GPU_GIB:-42}" \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    nohup ./.venv/bin/python scripts/llm_server.py \
+          --model "$MODEL_NAME" --port "$LLM_PORT" "$@" \
+          > "$glog" 2>&1 &
+    echo "    pid=$!  log=$glog"
+
+    if ! wait_health "http://localhost:$LLM_PORT/health" 1500; then
+        c_red "  single dual-GPU server NOT healthy"
+        tail -n 60 "$glog" >&2 || true
+        return 1
+    fi
+    export LLM_URLS="http://localhost:$LLM_PORT"
+    export AGENT_WORKERS="${AGENT_WORKERS:-4}"
+    c_green "  LLM_URLS=$LLM_URLS  AGENT_WORKERS=$AGENT_WORKERS  (single server, pipeline parallel across 2 GPUs)"
+    return 0
+}
+
 start_llm_parallel() {
     # Decision order:
-    #   USE_VLLM=1 (env) → try vLLM with Turing-compat flags; if it fails,
-    #                      fall through to dual bnb-transformers.
-    #   USE_VLLM=0 (default for stability on Turing) → dual bnb-transformers
-    #                      (one full model per GPU, both GPUs computing).
+    #   USE_VLLM=1 (env) → vLLM with Turing-compat flags; falls through on failure.
+    #   USE_DUAL_BNB=1   → two independent servers, one per GPU (data parallel).
+    #                      Only works if transformers can load the model on one
+    #                      GPU — fails on Qwen3-35B because peak fp16 load > 48 GB.
+    #   default          → ONE server, both GPUs visible (pipeline parallel).
+    #                      Slower than data parallel but the only mode that
+    #                      currently loads the 35B-A3B in 4-bit on Turing.
     if [ "${USE_VLLM:-0}" = "1" ]; then
         if start_llm_vllm "$@"; then
             return 0
         fi
-        c_red "  vLLM failed — falling back to dual bnb-transformers"
+        c_red "  vLLM failed — falling back to single dual-GPU bnb server"
     fi
-    start_llm_dual_bnb "$@"
+    if [ "${USE_DUAL_BNB:-0}" = "1" ]; then
+        if start_llm_dual_bnb "$@"; then
+            return 0
+        fi
+        c_red "  dual bnb failed (expected on 35B+) — falling back to single dual-GPU"
+    fi
+    start_llm_single_dual_gpu "$@"
 }
 
 ensure_tool_server() {
