@@ -460,10 +460,16 @@ else
         DISTILL_OK=1
     else
         BEFORE=0; [ -f "$TRACES" ] && BEFORE=$(wc -l < "$TRACES")
+        # Round-robin across ALL LLM endpoints so a single-server crash doesn't
+        # take down the whole distill. LLM_URLS comes from start_llm_dual_bnb.
+        DISTILL_URLS="${LLM_URLS:-http://localhost:$LLM_PORT}"
+        # Append /v1 to each URL if missing (start_llm_dual_bnb exports base, not /v1).
+        DISTILL_URLS=$(echo "$DISTILL_URLS" | python -c "import sys; print(','.join(u if u.endswith('/v1') else u+'/v1' for u in sys.stdin.read().strip().split(',') if u.strip()))")
+        c_green "  distill endpoints: $DISTILL_URLS"
         python scripts/distill.py \
             --train_file "$TRAIN_FOLD" \
             --output    "$TRACES" \
-            --model_url "http://localhost:$LLM_PORT/v1" \
+            --model_urls "$DISTILL_URLS" \
             --model_name "$MODEL_NAME" \
             --max_samples "$DISTILL_LIMIT" || c_red "  distill failed"
         AFTER=$(wc -l < "$TRACES")

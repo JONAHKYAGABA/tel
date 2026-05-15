@@ -323,14 +323,30 @@ def load_model(model_id: str, lora_path: Optional[str] = None) -> None:
     # device_map="auto" packs the second GPU full of weights and 3000-token
     # prompts OOM trying to allocate 5-6 GB for the forward pass.
     # LLM_PER_GPU_GIB env var lets you tune (default leaves ~5 GB headroom on 48 GB cards).
+    #
+    # IMPORTANT: Do NOT include "cpu" in max_memory. bnb 4-bit refuses to load
+    # when accelerate dispatches ANY layers to CPU (raises
+    # "Some modules are dispatched on the CPU or the disk"). A 35B MoE in 4-bit
+    # NF4 is ~18-20 GB and fits comfortably in 42 GiB; pinning to GPU only
+    # forces accelerate to pack everything on-device. To enable CPU offload
+    # explicitly, set LLM_CPU_OFFLOAD_GIB to a positive integer AND export
+    # LLM_INT8_FP32_CPU_OFFLOAD=1.
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     max_memory = None
+    cpu_off_enabled = os.environ.get("LLM_INT8_FP32_CPU_OFFLOAD", "0") == "1"
     if n_gpus >= 1:
         per_gpu = os.environ.get("LLM_PER_GPU_GIB", "42")
-        cpu_off = os.environ.get("LLM_CPU_OFFLOAD_GIB", "96")
         max_memory = {i: f"{per_gpu}GiB" for i in range(n_gpus)}
-        max_memory["cpu"] = f"{cpu_off}GiB"
+        if cpu_off_enabled:
+            cpu_off = os.environ.get("LLM_CPU_OFFLOAD_GIB", "0")
+            if int(cpu_off) > 0:
+                max_memory["cpu"] = f"{cpu_off}GiB"
         log.info(f"using max_memory={max_memory} (override via LLM_PER_GPU_GIB env)")
+
+    # bnb only honours fp32 CPU offload when explicitly asked for. Without it,
+    # any non-GPU dispatch is rejected at validate_environment time.
+    if cpu_off_enabled:
+        bnb.llm_int8_enable_fp32_cpu_offload = True
 
     t0 = time.time()
     base = AutoModelForCausalLM.from_pretrained(

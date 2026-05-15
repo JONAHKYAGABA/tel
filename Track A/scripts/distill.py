@@ -17,10 +17,12 @@ Run after the LLM server is up (default http://localhost:8001/v1):
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -143,7 +145,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_file", default="data/Phase_1/train.json")
     ap.add_argument("--output", default="traces/train_traces.jsonl")
-    ap.add_argument("--model_url", default=os.environ.get("MODEL_URL", "http://localhost:8001/v1"))
+    ap.add_argument("--model_url", default=os.environ.get("MODEL_URL", "http://localhost:8001/v1"),
+                    help="Single model URL. Overridden by --model_urls / LLM_URLS if set.")
+    ap.add_argument("--model_urls", default=os.environ.get("LLM_URLS", ""),
+                    help="Comma-separated URLs for round-robin failover (e.g. "
+                         "http://localhost:8001/v1,http://localhost:8002/v1).")
     ap.add_argument("--model_name", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
     ap.add_argument("--max_samples", type=int, default=None,
                     help="Cap the number of scenarios processed (None = all)")
@@ -165,7 +171,15 @@ def main() -> int:
     done = load_done(out_path)
     print(f"[distill] {len(done)} already accepted in {out_path}; will skip")
 
-    client = OpenAI(base_url=args.model_url, api_key=API_KEY)
+    urls = [u.strip() for u in (args.model_urls or args.model_url).split(",") if u.strip()]
+    print(f"[distill] llm endpoints: {urls}")
+    clients = [OpenAI(base_url=u, api_key=API_KEY, timeout=180.0) for u in urls]
+    url_cycle = itertools.cycle(range(len(clients)))
+    url_lock = threading.Lock()
+
+    def next_client_idx() -> int:
+        with url_lock:
+            return next(url_cycle)
 
     accepted = 0
     rejected = 0
@@ -192,16 +206,19 @@ def main() -> int:
             this_accepted: Optional[Dict[str, Any]] = None
             this_attempts: List[Dict[str, Any]] = []
             for attempt in range(args.attempts_per_scenario):
+                # Round-robin across all configured endpoints. On Connection error,
+                # the next attempt will hit a different server automatically.
+                ci = next_client_idx()
                 try:
-                    resp = client.chat.completions.create(
+                    resp = clients[ci].chat.completions.create(
                         model=args.model_name,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=args.temperature,
                         max_tokens=args.max_tokens,
                     )
                 except Exception as e:
-                    print(f"[distill] {sid} attempt {attempt+1} API error: {e}")
-                    this_attempts.append({"attempt": attempt + 1, "error": str(e)})
+                    print(f"[distill] {sid} attempt {attempt+1} via {urls[ci]} API error: {e}")
+                    this_attempts.append({"attempt": attempt + 1, "url": urls[ci], "error": str(e)})
                     continue
                 trace = resp.choices[0].message.content or ""
                 pred = normalize_multi_answer(extract_answer_all(trace))
