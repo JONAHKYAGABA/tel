@@ -105,15 +105,35 @@ STEP 4 — CROSS-CHECK traffic_data
   • Low Downlink CCE Allocation Success Rate   → confirms PDCCH / SCHEDULER
   • High PRB Utilization + throughput dip      → load/scheduling
 
-STEP 5 — OPTIONAL TOOL CALL (≤1, only if it disambiguates two actions)
-  • judge_mainlobe_or_not(time, pci)
-      Disambiguates azimuth-rotation vs tilt-change. If UE is OUTSIDE
-      the mainlobe → prefer azimuth. If INSIDE → prefer tilt.
-  • calculate_overlap_ratio(pci_serving, pci_neighbor)
-      Ratio > 0.3 implicates that neighbor as the interferer.
-  • calculate_pathloss(time, pci)
-      Confirms coverage degradation when RSRP-based reasoning is ambiguous.
-  Do NOT call data-fetch tools (the scenario inlines everything you need).
+STEP 5 — OPTIONAL TOOL CALL (≤1, only if it disambiguates two actions).
+  You have these 6 computation tools available (already loaded — call by name):
+
+    • judge_mainlobe_or_not(time, pci)
+        Returns whether the UE is inside the mainlobe of serving cell `pci`
+        at `time`. OUTSIDE → prefer azimuth action; INSIDE → prefer tilt.
+
+    • calculate_overlap_ratio(pci_serving, pci_neighbor)
+        Returns coverage overlap (0–1). > 0.3 implicates that neighbor as
+        the interferer; prefer tilt-down / decrease-power on the neighbor.
+
+    • calculate_pathloss(time, pci)
+        Returns the pathloss in dB at `time` for cell `pci`. Confirms
+        coverage degradation when RSRP-based reasoning is ambiguous.
+
+    • calculate_horizontal_angle(time, pci)
+        Returns the bearing (degrees) from cell `pci` to UE at `time`.
+        Use to choose how much azimuth to rotate.
+
+    • calculate_tilt_angle(time, pci)
+        Returns the recommended tilt for cell `pci` at `time`. Use to
+        choose between "lift the tilt" vs "press down the tilt".
+
+    • optimize_antenna_gain(time, pci)
+        Returns a suggested antenna gain optimisation for cell `pci`.
+
+  Skip tools entirely if the inline data is unambiguous. Do NOT call any
+  data-fetch tool (e.g. get_user_plane_data) — that data is already inlined
+  in this prompt.
 
 STEP 6 — MAP FAILURE MODE → ACTION TEMPLATE → CORRECT CELL
   The 22 options are templated actions parameterised by a SPECIFIC gNodeB_Cell.
@@ -224,12 +244,34 @@ ENDPOINT_MAP = {
 
 _EXCLUDE_META = {"health", "get_all_scenario", "get_available_tools"}
 
+# Only expose to the LLM the tools that produce DERIVED information not already
+# in the inlined scenario data. Data-fetch tools (get_serving_cell_rsrp, etc.)
+# retrieve slices of data the agent already has — they just bloat the prompt
+# without changing what the model can know. The 6 here are the actual compute
+# tools that change what the model knows. Override via AGENT_TOOLS_ALLOWLIST.
+_DEFAULT_ALLOW_TOOLS = {
+    "judge_mainlobe_or_not",
+    "calculate_overlap_ratio",
+    "calculate_pathloss",
+    "calculate_horizontal_angle",
+    "calculate_tilt_angle",
+    "optimize_antenna_gain",
+}
+_env_allow = os.environ.get("AGENT_TOOLS_ALLOWLIST", "").strip()
+if _env_allow:
+    _ALLOW_TOOLS = {t.strip() for t in _env_allow.split(",") if t.strip()}
+elif _env_allow == "ALL":
+    _ALLOW_TOOLS = None  # no filter
+else:
+    _ALLOW_TOOLS = _DEFAULT_ALLOW_TOOLS
+
 # Tool descriptors lazy-loaded from server.py /tools on first use.
 _TOOL_DEFS_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
 def _fetch_tool_defs(tool_url: str, timeout_s: float = 10.0) -> List[Dict[str, Any]]:
-    """Discover the full tool catalog from server.py /tools. Cached for the run."""
+    """Discover the tool catalog from server.py /tools, filtered to compute
+    tools only (by default). Cached for the run."""
     global _TOOL_DEFS_CACHE
     if _TOOL_DEFS_CACHE is not None:
         return _TOOL_DEFS_CACHE
@@ -251,6 +293,7 @@ def _fetch_tool_defs(tool_url: str, timeout_s: float = 10.0) -> List[Dict[str, A
         return _TOOL_DEFS_CACHE
 
     tools: List[Dict[str, Any]] = []
+    n_total = n_kept = 0
     if isinstance(raw, list):
         for t in raw:
             if not isinstance(t, dict):
@@ -259,14 +302,19 @@ def _fetch_tool_defs(tool_url: str, timeout_s: float = 10.0) -> List[Dict[str, A
             name = fn.get("name") if isinstance(fn, dict) else None
             if not name or name in _EXCLUDE_META:
                 continue
+            n_total += 1
+            if _ALLOW_TOOLS is not None and name not in _ALLOW_TOOLS:
+                continue
+            n_kept += 1
             # Normalize to OpenAI tools schema
             if t.get("type") == "function" and "function" in t:
                 tools.append(t)
             else:
                 tools.append({"type": "function", "function": fn})
     _TOOL_DEFS_CACHE = tools
-    print(f"  [tools] loaded {len(tools)} tool descriptors from {tool_url}/tools",
-          file=sys.stderr)
+    allow_str = "ALL" if _ALLOW_TOOLS is None else ",".join(sorted(_ALLOW_TOOLS))
+    print(f"  [tools] kept {n_kept}/{n_total} from {tool_url}/tools "
+          f"(allowlist={allow_str})", file=sys.stderr)
     return tools
 
 
