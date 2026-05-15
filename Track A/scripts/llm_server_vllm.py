@@ -69,13 +69,14 @@ def main() -> int:
         "--max-model-len", str(args.max_model_len),
         "--trust-remote-code",
         "--dtype", "float16",
-        "--disable-log-requests",
+        # Note: newer vLLM uses --no-enable-log-requests; older uses --disable-log-requests.
+        # We omit the flag entirely — request logging is fine for diagnostics.
     ]
 
     if quant == "bitsandbytes":
-        # vLLM ≥0.6 supports bnb 4-bit on-the-fly
-        cmd += ["--quantization", "bitsandbytes",
-                "--load-format", "bitsandbytes"]
+        # vLLM bnb support is gated on version. Newer vLLM rejects --load-format
+        # bitsandbytes too. Try --quantization only; if it fails we'll diagnose.
+        cmd += ["--quantization", "bitsandbytes"]
     elif quant in ("awq", "gptq"):
         cmd += ["--quantization", quant]
     elif quant in ("none", "fp16", ""):
@@ -91,6 +92,11 @@ def main() -> int:
             "--max-lora-rank", os.environ.get("MAX_LORA_RANK", "32"),
             "--lora-modules", f"adapter={args.lora}",
         ]
+
+    # Optional extras from env (newer vLLM has many flags; allow ad-hoc additions)
+    extra = os.environ.get("VLLM_EXTRA_ARGS", "").strip()
+    if extra:
+        cmd += extra.split()
 
     print("[vllm] launching:", " ".join(cmd), flush=True)
     # Replace current process — vLLM owns stdout/stderr now
