@@ -148,8 +148,8 @@ start_llm_vllm() {
 }
 
 start_llm_server() {
-    # FALLBACK: single-instance transformers+bnb launcher.
-    # Used if USE_VLLM=0 or vLLM fails to start.
+    # Single-instance transformers+bnb launcher.
+    # device_map="auto" spans all visible GPUs (pipeline-parallel).
     pkill -f "scripts/llm_server.py" 2>/dev/null || true
     pkill -f "vllm.entrypoints" 2>/dev/null || true
     sleep 5
@@ -163,16 +163,77 @@ start_llm_server() {
     return 0
 }
 
+start_llm_dual_bnb() {
+    # PRIMARY for Turing/RTX 8000: one full-model transformers+bnb instance
+    # per GPU on distinct ports. The 35B-A3B in 4-bit is ~22 GB so it fits
+    # comfortably on a single 48 GB card; running two independent copies
+    # gives true data-parallel throughput across both GPUs.
+    local extra_args=("$@")
+    pkill -f "scripts/llm_server.py" 2>/dev/null || true
+    pkill -f "vllm.entrypoints" 2>/dev/null || true
+    sleep 5
+
+    local n_gpus
+    n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "${n_gpus:-0}" -le 1 ]; then
+        echo "  only ${n_gpus:-0} GPU(s) — falling back to single-instance"
+        start_llm_server "${extra_args[@]}" || return 1
+        return 0
+    fi
+
+    local urls=""
+    local g
+    for ((g=0; g<n_gpus; g++)); do
+        local port=$((LLM_PORT + g))
+        local glog="eval/logs/run_all/llm_server_gpu${g}.log"
+        echo "  starting llm_server on GPU $g (port $port)"
+        CUDA_VISIBLE_DEVICES=$g \
+        LLM_PER_GPU_GIB="${LLM_PER_GPU_GIB:-42}" \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        nohup python scripts/llm_server.py \
+              --model "$MODEL_NAME" --port "$port" "${extra_args[@]}" \
+              > "$glog" 2>&1 &
+        echo "    pid=$!  log=$glog"
+        if [ -z "$urls" ]; then
+            urls="http://localhost:$port"
+        else
+            urls="$urls,http://localhost:$port"
+        fi
+    done
+
+    local any_ok=0
+    for ((g=0; g<n_gpus; g++)); do
+        local port=$((LLM_PORT + g))
+        if wait_health "http://localhost:$port/health" 1500; then
+            any_ok=1
+        else
+            c_red "  GPU $g llm_server NOT healthy (port $port)"
+            tail -n 40 "eval/logs/run_all/llm_server_gpu${g}.log" >&2 || true
+        fi
+    done
+    if [ "$any_ok" != "1" ]; then
+        c_red "  no llm_server became healthy"
+        return 1
+    fi
+    export LLM_URLS="$urls"
+    export AGENT_WORKERS="$n_gpus"
+    c_green "  LLM_URLS=$LLM_URLS  AGENT_WORKERS=$AGENT_WORKERS  (true data parallelism)"
+    return 0
+}
+
 start_llm_parallel() {
-    # Try vLLM first (single process, both GPUs via TP); fall back to
-    # bnb-transformers single-instance if vLLM fails or USE_VLLM=0.
-    if [ "${USE_VLLM:-1}" = "1" ]; then
+    # Decision order:
+    #   USE_VLLM=1 (env) → try vLLM with Turing-compat flags; if it fails,
+    #                      fall through to dual bnb-transformers.
+    #   USE_VLLM=0 (default for stability on Turing) → dual bnb-transformers
+    #                      (one full model per GPU, both GPUs computing).
+    if [ "${USE_VLLM:-0}" = "1" ]; then
         if start_llm_vllm "$@"; then
             return 0
         fi
-        c_red "  vLLM start failed — falling back to transformers+bnb"
+        c_red "  vLLM failed — falling back to dual bnb-transformers"
     fi
-    start_llm_server "$@"
+    start_llm_dual_bnb "$@"
 }
 
 ensure_tool_server() {
@@ -230,8 +291,9 @@ source .venv/bin/activate
 
 if [ "$SKIP_INSTALL" = "1" ]; then
     c_yel "  SKIP_INSTALL=1 — trusting current deps"
-elif python -c "import torch, transformers, peft, bitsandbytes, fastapi, pandas, sentence_transformers, trafilatura, datasets, vllm" >/dev/null 2>&1; then
-    c_yel "  all deps already present (incl. vllm)"
+elif python -c "import torch, transformers, peft, bitsandbytes, fastapi, pandas, sentence_transformers, trafilatura, datasets" >/dev/null 2>&1 && \
+     { [ "${USE_VLLM:-0}" = "0" ] || python -c "import vllm" >/dev/null 2>&1; }; then
+    c_yel "  all deps already present"
 else
     echo "  upgrading pip"
     pip install --upgrade -q pip wheel setuptools
