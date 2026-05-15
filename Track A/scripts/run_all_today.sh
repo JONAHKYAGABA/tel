@@ -441,9 +441,9 @@ fi
 # ============ J. restart llm_server (with LoRA if available) ========
 step "J. Restart llm_server"
 if [ "$LORA_AVAILABLE" = "1" ]; then
-    start_llm_server --lora "$LORA_DIR" || { c_red "lora server failed"; exit 1; }
+    start_llm_parallel --lora "$LORA_DIR" || { c_red "lora server (parallel) failed"; exit 1; }
 else
-    start_llm_server || { c_red "base server restart failed"; exit 1; }
+    start_llm_parallel || { c_red "base server (parallel) restart failed"; exit 1; }
 fi
 ensure_tool_server || true
 
@@ -491,8 +491,6 @@ fi
 SCORE_LORA_RAG=""
 if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
     step "M. Agentic holdout with LoRA + RAG"
-    # NOTE: agentic_agent.py doesn't have --use_rag yet; falls through transparently.
-    # If you've wired it, add the flag. For now we score the same as M=K.
     if [ ! -f eval/results/holdout_lora_rag.log ] || \
        [ ! -f eval/results/holdout_lora_rag/result.csv ] || \
        [ "$(wc -l < eval/results/holdout_lora_rag/result.csv 2>/dev/null || echo 0)" -lt 200 ]; then
@@ -502,11 +500,40 @@ if [ "$LORA_AVAILABLE" = "1" ] && [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT
             --out_dir   eval/results/holdout_lora_rag \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
+            --use_rag --rag_k 3 \
             --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 120 2>&1 | tee eval/results/holdout_lora_rag.log
+            --scenario_timeout_s 240 2>&1 | tee eval/results/holdout_lora_rag.log
     fi
     SCORE_LORA_RAG=$(extract_score eval/results/holdout_lora_rag.log)
     c_green "  LoRA+RAG holdout: ${SCORE_LORA_RAG:-?}"
+fi
+
+# ============ M'. holdout with RAG only (no LoRA) — important diagnostic ====
+SCORE_RAG=""
+if [ "$RAG_AVAILABLE" = "1" ] && [ "$SKIP_HOLDOUT" != "1" ]; then
+    step "M'. Agentic holdout with RAG only (no LoRA)"
+    # Ensure server is the base model (not LoRA) for this comparison
+    if curl -s "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '+lora'; then
+        c_yel "  server has LoRA — restarting base for RAG-only baseline"
+        pkill -f "scripts/llm_server.py" 2>/dev/null || true
+        sleep 5
+        start_llm_parallel || c_red "  could not bring base back up"
+    fi
+    if [ ! -f eval/results/holdout_rag.log ] || \
+       [ ! -f eval/results/holdout_rag/result.csv ] || \
+       [ "$(wc -l < eval/results/holdout_rag/result.csv 2>/dev/null || echo 0)" -lt 200 ]; then
+        rm -rf eval/results/holdout_rag
+        python scripts/agentic_agent.py \
+            --test_file "$HOLDOUT" \
+            --out_dir   eval/results/holdout_rag \
+            --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
+            --tool_url  "$TOOL_URL" \
+            --use_rag --rag_k 3 \
+            --max_tokens 768 --max_tool_calls 1 \
+            --scenario_timeout_s 240 2>&1 | tee eval/results/holdout_rag.log
+    fi
+    SCORE_RAG=$(extract_score eval/results/holdout_rag.log)
+    c_green "  RAG-only holdout: ${SCORE_RAG:-?}"
 fi
 
 # ============ N. pick best config ==================================
@@ -519,29 +546,42 @@ choose() {
     fi
 }
 choose "baseline" "$SCORE_BASE"
+choose "RAG"      "$SCORE_RAG"
 choose "LoRA"     "$SCORE_LORA"
 choose "LoRA+RAG" "$SCORE_LORA_RAG"
 
-echo "  baseline   : ${SCORE_BASE:-?}"
-echo "  LoRA       : ${SCORE_LORA:-?}"
-echo "  LoRA+RAG   : ${SCORE_LORA_RAG:-?}"
+echo "  baseline    : ${SCORE_BASE:-?}"
+echo "  RAG         : ${SCORE_RAG:-?}"
+echo "  LoRA        : ${SCORE_LORA:-?}"
+echo "  LoRA+RAG    : ${SCORE_LORA_RAG:-?}"
 c_green "  WINNER -> $BEST_LABEL (score=${BEST_SCORE:-?})"
 
-# Ensure server matches winning config
+# Ensure llm_server matches winning config (parallel launch in either case)
 case "$BEST_LABEL" in
-    baseline)
-        if curl -s "http://localhost:$LLM_PORT/health" | grep -q '+lora'; then
-            start_llm_server || c_red "  could not switch to base"
+    baseline|RAG)
+        if curl -s "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '+lora'; then
+            pkill -f "scripts/llm_server.py" 2>/dev/null || true
+            sleep 5
+            start_llm_parallel || c_red "  could not switch to base"
         fi ;;
     LoRA*)
-        if ! curl -s "http://localhost:$LLM_PORT/health" | grep -q '+lora'; then
-            start_llm_server --lora "$LORA_DIR" || c_red "  could not switch to LoRA"
+        if ! curl -s "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '+lora'; then
+            pkill -f "scripts/llm_server.py" 2>/dev/null || true
+            sleep 5
+            start_llm_parallel --lora "$LORA_DIR" || c_red "  could not switch to LoRA"
         fi ;;
+esac
+
+# RAG flag is set per-config
+RAG_FLAG=""
+case "$BEST_LABEL" in
+    RAG|LoRA+RAG) RAG_FLAG="--use_rag --rag_k 3" ;;
 esac
 
 # ============ O. final run on test set =============================
 case "$BEST_LABEL" in
     baseline) FINAL_DIR="eval/results/final_baseline" ;;
+    RAG)      FINAL_DIR="eval/results/final_rag" ;;
     LoRA)     FINAL_DIR="eval/results/final_lora" ;;
     LoRA+RAG) FINAL_DIR="eval/results/final_lora_rag" ;;
     *)        FINAL_DIR="eval/results/final" ;;
@@ -550,7 +590,7 @@ esac
 if [ "$SKIP_FINAL" = "1" ]; then
     c_yel "O. SKIP_FINAL=1 — not running on test set"
 else
-    step "O. Final run on $TEST_FILE  (output: $FINAL_DIR)"
+    step "O. Final run on $TEST_FILE  (output: $FINAL_DIR  config=$BEST_LABEL)"
     if [ -f "$FINAL_DIR/result.csv" ] && \
        [ "$(wc -l < "$FINAL_DIR/result.csv")" -ge 500 ]; then
         c_yel "  $FINAL_DIR/result.csv already complete — skipping"
@@ -561,8 +601,9 @@ else
             --out_dir   "$FINAL_DIR" \
             --llm_urls  "${LLM_URLS:-http://localhost:$LLM_PORT}" \
             --tool_url  "$TOOL_URL" \
+            $RAG_FLAG \
             --max_tokens 768 --max_tool_calls 1 \
-            --scenario_timeout_s 120 2>&1 | tee "${FINAL_DIR}.log"
+            --scenario_timeout_s 240 2>&1 | tee "${FINAL_DIR}.log"
     fi
 fi
 

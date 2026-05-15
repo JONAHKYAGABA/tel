@@ -52,6 +52,77 @@ from scripts.build_baseline_submission import pick_answer as heuristic_pick  # n
 from scripts.build_baseline_submission import is_multi as task_is_multi  # noqa: E402
 
 
+# --------------------------------------------------------------------- RAG
+
+_RAG_MODEL = None
+_RAG_CHUNKS: Optional[List[Dict[str, Any]]] = None
+_RAG_EMBS = None  # numpy array (n_chunks, dim)
+
+
+def _init_rag(kb_dir: Path) -> bool:
+    """Lazy-load sentence-transformers + KB chunks + embeddings.
+    Returns True if RAG is usable. Idempotent."""
+    global _RAG_MODEL, _RAG_CHUNKS, _RAG_EMBS
+    if _RAG_MODEL is not None:
+        return True
+    chunks_path = kb_dir / "chunks.json"
+    embs_path = kb_dir / "embeddings.npy"
+    if not chunks_path.exists() or not embs_path.exists():
+        print(f"[rag] index not found at {kb_dir} — run scripts/build_kb_index.py",
+              file=sys.stderr)
+        return False
+    try:
+        import numpy as np  # noqa: F401
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print("[rag] sentence-transformers/numpy not installed; pip install them",
+              file=sys.stderr)
+        return False
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    model_id = os.environ.get("RAG_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    print(f"[rag] loading embedding model {model_id} (~80 MB, CPU)", file=sys.stderr)
+    _RAG_MODEL = SentenceTransformer(model_id)
+    _RAG_CHUNKS = json.loads(chunks_path.read_text(encoding="utf-8"))
+    import numpy as np
+    _RAG_EMBS = np.load(embs_path)
+    print(f"[rag] indexed {len(_RAG_CHUNKS)} chunks (dim={_RAG_EMBS.shape[1]})",
+          file=sys.stderr)
+    return True
+
+
+def _rag_query(scenario: Dict[str, Any]) -> str:
+    """Short query derived from the scenario's task + options (NOT the full data,
+    which would dilute the signal)."""
+    task_desc = ((scenario.get("task") or {}).get("description") or "")[:300]
+    opts = " | ".join(
+        (o.get("label") or "")
+        for o in ((scenario.get("task") or {}).get("options") or [])
+    )[:700]
+    return f"5G RAN troubleshooting. {task_desc} Candidate actions: {opts}"
+
+
+def _retrieve_context(scenario: Dict[str, Any], k: int = 3,
+                      max_chars_per_chunk: int = 700) -> str:
+    """Top-k cosine search over the KB. Returns a markdown block or '' if disabled."""
+    import numpy as np
+    if _RAG_MODEL is None or _RAG_CHUNKS is None or _RAG_EMBS is None:
+        return ""
+    q = _RAG_MODEL.encode([_rag_query(scenario)], convert_to_numpy=True)[0].astype("float32")
+    q_norm = np.linalg.norm(q) + 1e-8
+    e_norms = np.linalg.norm(_RAG_EMBS, axis=1) + 1e-8
+    sims = (_RAG_EMBS @ q) / (e_norms * q_norm)
+    top_idx = np.argsort(-sims)[:k]
+    parts = []
+    for i in top_idx:
+        c = _RAG_CHUNKS[int(i)]
+        text = c["text"][:max_chars_per_chunk]
+        src = c.get("source", "kb")
+        parts.append(f"From {src}:\n{text}")
+    return ("## Reference Knowledge (top-{} retrieved 5G/3GPP passages)\n\n"
+            .format(k)) + "\n\n---\n\n".join(parts)
+
+
 # --------------------------------------------------------------------- prompts
 
 _SYSTEM_BODY = """\
@@ -375,17 +446,19 @@ def _extract_boxed(text: str, valid_options: List[str]) -> str:
     return "|".join(parts)
 
 
-def _format_question(scenario: Dict[str, Any]) -> str:
+def _format_question(scenario: Dict[str, Any], rag_block: str = "") -> str:
     options = (scenario.get("task") or {}).get("options", []) or []
     options_block = "\n".join(f"  {o['id']}: {o['label']}" for o in options if "id" in o)
     task_desc = (scenario.get("task") or {}).get("description") or ""
     data_block = _truncate_scenario(scenario)
-    return (
-        f"{data_block}\n\n"
-        f"## Task\n{task_desc}\n\n"
-        f"## Options\n{options_block}\n\n"
-        f"Final answer:"
-    )
+    parts = []
+    if rag_block:
+        parts.append(rag_block)
+    parts.append(data_block)
+    parts.append(f"## Task\n{task_desc}")
+    parts.append(f"## Options\n{options_block}")
+    parts.append("Final answer:")
+    return "\n\n".join(parts)
 
 
 def _execute_tool(
@@ -472,16 +545,19 @@ def _agent_turn(
     timeout_s: float,
     max_tokens: int,
     max_tool_calls: int = 2,
+    rag_k: int = 0,
 ) -> Dict[str, Any]:
     """
     Agentic loop for one scenario. Up to `max_tool_calls` tool calls + 1
-    final answer. All server.py tools are available; the LLM picks which.
+    final answer. Tools are filtered to compute tools by default.
+    If `rag_k > 0` and the KB is loaded, retrieves top-k chunks and prepends.
     Returns dict with text, tool_calls_made, num_tool_calls.
     """
     sid = scenario.get("scenario_id", "")
     is_multi = task_is_multi(scenario)
     system = SYSTEM_PROMPT_MULTI if is_multi else SYSTEM_PROMPT_SINGLE
-    question = _format_question(scenario)
+    rag_block = _retrieve_context(scenario, k=rag_k) if rag_k > 0 else ""
+    question = _format_question(scenario, rag_block=rag_block)
     tool_defs = _fetch_tool_defs(tool_url)
 
     messages: List[Dict[str, Any]] = [
@@ -587,7 +663,23 @@ def main() -> int:
                     help="Max number of tool-call turns per scenario before forcing final answer.")
     ap.add_argument("--workers", type=int, default=int(os.environ.get("AGENT_WORKERS", "1")),
                     help="Concurrent scenario workers. Set to len(llm_urls) for true GPU parallelism.")
+    ap.add_argument("--use_rag", action="store_true",
+                    help="Retrieve top-k chunks from knowledge/processed and prepend to prompt.")
+    ap.add_argument("--rag_k", type=int, default=int(os.environ.get("RAG_K", "3")),
+                    help="Number of KB chunks to retrieve per scenario when --use_rag.")
+    ap.add_argument("--rag_dir", default=os.environ.get("RAG_DIR", "knowledge/processed"),
+                    help="Directory with chunks.json + embeddings.npy.")
     args = ap.parse_args()
+
+    # Initialise RAG if requested
+    rag_active_k = 0
+    if args.use_rag:
+        kb_path = (PROJECT_DIR / args.rag_dir).resolve()
+        if _init_rag(kb_path):
+            rag_active_k = args.rag_k
+            print(f"[rag] active: top-{rag_active_k} retrieval from {kb_path}")
+        else:
+            print(f"[rag] disabled — falling back to no-RAG mode", file=sys.stderr)
 
     # Resolve URL list: --llm_urls (comma-sep) overrides --llm_url
     if args.llm_urls:
@@ -687,7 +779,7 @@ def main() -> int:
                 fut = ex.submit(
                     _agent_turn, scenario, url, args.tool_url,
                     args.model_name, args.llm_timeout_s, args.max_tokens,
-                    args.max_tool_calls,
+                    args.max_tool_calls, rag_active_k,
                 )
                 try:
                     res = fut.result(timeout=args.scenario_timeout_s)
